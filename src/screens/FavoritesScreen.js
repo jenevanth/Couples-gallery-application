@@ -1,29 +1,28 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
-  FlatList,
   StyleSheet,
+  FlatList,
   TouchableOpacity,
   ActivityIndicator,
   Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import PhotoGridItem from '../components/PhotoGridItem';
 import { useTheme } from '../theme/ThemeContext';
-import Icon from 'react-native-vector-icons/Ionicons';
+import { supabase } from '../services/supabase';
+import PhotoGridItem from '../components/PhotoGridItem';
 import ImageViewing from 'react-native-image-viewing';
 import Share from 'react-native-share';
 import BlobUtil from 'react-native-blob-util';
-import { supabase } from '../services/supabase';
+import Icon from 'react-native-vector-icons/Ionicons';
 import Modal from 'react-native-modal';
 import ErrorModal from '../components/ErrorModal';
 
-const DayGalleryScreen = ({ route, navigation }) => {
+const FavoritesScreen = ({ navigation }) => {
   const { theme } = useTheme();
-  const { date, images: initialImages } = route.params;
-
-  const [images, setImages] = useState(initialImages || []);
+  const [images, setImages] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [isViewerVisible, setIsViewerVisible] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
@@ -33,20 +32,66 @@ const DayGalleryScreen = ({ route, navigation }) => {
     visible: false,
     message: '',
   });
-  const [loading, setLoading] = useState(false);
 
   // Debug log for every render
-  console.log('[DayGalleryScreen] Render', {
+  console.log('[FavoritesScreen] Render', {
+    loading,
     imagesCount: images.length,
-    date,
   });
+
+  // Fetch favorites from Supabase
+  const fetchFavorites = useCallback(async () => {
+    console.log(
+      '[FavoritesScreen] --- Fetching favorites from Supabase... ---',
+    );
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('images')
+      .select('*')
+      .eq('favorite', true)
+      .order('created_at', { ascending: false });
+    if (error) {
+      setErrorModal({ visible: true, message: error.message });
+      setImages([]);
+    } else {
+      setImages(data || []);
+      console.log(
+        '[FavoritesScreen] Supabase fetch success. Images:',
+        data?.length,
+        data,
+      );
+    }
+    setLoading(false);
+  }, []);
+
+  // Real-time updates
+  useEffect(() => {
+    fetchFavorites();
+    const imagesChannel = supabase
+      .channel('public:images')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'images' },
+        payload => {
+          console.log(
+            '[FavoritesScreen] --- Supabase real-time event received ---',
+            payload.eventType,
+          );
+          fetchFavorites();
+        },
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(imagesChannel);
+    };
+  }, [fetchFavorites]);
 
   // Open image viewer
   const openImage = index => {
     setCurrentIndex(index);
     setIsViewerVisible(true);
     console.log(
-      '[DayGalleryScreen] Opened viewer for image:',
+      '[FavoritesScreen] Opened viewer for image:',
       images[index]?.id,
       'at index',
       index,
@@ -57,7 +102,7 @@ const DayGalleryScreen = ({ route, navigation }) => {
   const openDeleteModal = image => {
     setSelectedImage(image);
     setIsDeleteModalVisible(true);
-    console.log('[DayGalleryScreen] Opened delete modal for image:', image.id);
+    console.log('[FavoritesScreen] Opened delete modal for image:', image.id);
   };
 
   // Delete image
@@ -73,8 +118,8 @@ const DayGalleryScreen = ({ route, navigation }) => {
       } else {
         setIsDeleteModalVisible(false);
         setSelectedImage(null);
-        setImages(images.filter(img => img.id !== selectedImage.id));
-        console.log('[DayGalleryScreen] Deleted image:', selectedImage.id);
+        fetchFavorites();
+        console.log('[FavoritesScreen] Deleted image:', selectedImage.id);
       }
     } catch (e) {
       setErrorModal({ visible: true, message: e.message });
@@ -87,7 +132,7 @@ const DayGalleryScreen = ({ route, navigation }) => {
       const image = images[currentIndex];
       if (!image) return;
       await Share.open({ url: image.image_url });
-      console.log('[DayGalleryScreen] Shared image:', image.image_url);
+      console.log('[FavoritesScreen] Shared image:', image.image_url);
     } catch (e) {
       setErrorModal({ visible: true, message: e.message });
     }
@@ -110,13 +155,13 @@ const DayGalleryScreen = ({ route, navigation }) => {
         visible: true,
         message: 'Image saved to your device.',
       });
-      console.log('[DayGalleryScreen] Saved image to device:', downloadDest);
+      console.log('[FavoritesScreen] Saved image to device:', downloadDest);
     } catch (e) {
       setErrorModal({ visible: true, message: e.message });
     }
   };
 
-  // Toggle favorite
+  // Toggle favorite (unfavorite)
   const handleToggleFavorite = async image => {
     try {
       const updated = !image.favorite;
@@ -130,7 +175,7 @@ const DayGalleryScreen = ({ route, navigation }) => {
         ),
       );
       console.log(
-        '[DayGalleryScreen] Toggled favorite for image:',
+        '[FavoritesScreen] Toggled favorite for image:',
         image.id,
         'Now:',
         updated,
@@ -153,16 +198,19 @@ const DayGalleryScreen = ({ route, navigation }) => {
       ]}
     >
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()}>
-          <Icon name="arrow-back" size={28} color={theme.colors.primary} />
-        </TouchableOpacity>
         <Text style={[styles.title, { color: theme.colors.primary }]}>
-          {date}
+          Favorites
         </Text>
-        <View style={{ width: 28 }} />
       </View>
       {loading ? (
         <ActivityIndicator size="large" color={theme.colors.primary} />
+      ) : images.length === 0 ? (
+        <View style={styles.emptyState}>
+          <Icon name="heart-outline" size={60} color="#FF80AB" />
+          <Text style={{ color: '#888', marginTop: 10, fontSize: 16 }}>
+            No favorites yet!
+          </Text>
+        </View>
       ) : (
         <FlatList
           data={images}
@@ -262,8 +310,12 @@ const DayGalleryScreen = ({ route, navigation }) => {
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 16 },
-  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 16 },
-  title: { flex: 1, textAlign: 'center', fontSize: 20, fontWeight: 'bold' },
+  header: {
+    alignItems: 'center',
+    marginBottom: 16,
+    paddingTop: 8,
+  },
+  title: { fontSize: 22, fontWeight: 'bold' },
   grid: { paddingBottom: 20 },
   viewerFooter: {
     flexDirection: 'row',
@@ -295,6 +347,12 @@ const styles = StyleSheet.create({
     minWidth: 80,
     alignItems: 'center',
   },
+  emptyState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 60,
+  },
 });
 
-export default DayGalleryScreen;
+export default FavoritesScreen;

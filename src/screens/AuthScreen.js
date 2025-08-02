@@ -52,7 +52,7 @@ const AuthScreen = ({ navigation }) => {
         console.log(
           '[AuthScreen] Found active session, navigating to Gallery.',
         );
-        navigation.replace('Gallery');
+        navigation.replace('MainTabs');
       }
     });
 

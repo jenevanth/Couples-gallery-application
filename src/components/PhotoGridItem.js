@@ -1,20 +1,17 @@
 import React from 'react';
-import {
-  Image,
-  StyleSheet,
-  Dimensions,
-  View,
-  TouchableOpacity,
-} from 'react-native';
+import { Image, StyleSheet, Dimensions, TouchableOpacity } from 'react-native';
 
 const { width } = Dimensions.get('window');
-const itemSize = (width - 30) / 2; // 2 columns, 10px margin
+const itemSize = (width - 40) / 2;
 
-const PhotoGridItem = ({ image, index, onPress }) => {
-  console.log('[PhotoGridItem] Rendering:', image?.image_url);
+const PhotoGridItem = ({ image, onPress }) => {
   if (!image || !image.image_url) return null;
   return (
-    <TouchableOpacity onPress={onPress} style={styles.container}>
+    <TouchableOpacity
+      onPress={onPress}
+      style={styles.container}
+      activeOpacity={0.85}
+    >
       <Image source={{ uri: image.image_url }} style={styles.image} />
     </TouchableOpacity>
   );
@@ -25,14 +22,14 @@ const styles = StyleSheet.create({
     width: itemSize,
     height: itemSize,
     margin: 5,
-    borderRadius: 8,
+    borderRadius: 12,
     overflow: 'hidden',
   },
   image: {
     width: '100%',
     height: '100%',
-    borderRadius: 8,
-    backgroundColor: '#282828',
+    borderRadius: 12,
+    backgroundColor: '#eee',
   },
 });
 
