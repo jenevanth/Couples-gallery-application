@@ -4,8 +4,9 @@ buildscript {
         minSdkVersion = 24
         compileSdkVersion = 35
         targetSdkVersion = 35
-        ndkVersion = "27.1.12297006"
-        kotlinVersion = "2.1.20"
+        ndkVersion = "26.1.10909125"
+        kotlinVersion = "2.0.21"
+        googlePlayServicesAuthVersion = "20.7.0"
     }
     repositories {
         google()

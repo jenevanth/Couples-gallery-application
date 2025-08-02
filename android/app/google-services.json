@@ -1,0 +1,55 @@
+{
+  "project_info": {
+    "project_number": "263236519188",
+    "project_id": "ourmoments-20e48",
+    "storage_bucket": "ourmoments-20e48.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:263236519188:android:077606054736c325db6e01",
+        "android_client_info": {
+          "package_name": "com.boyfriend_needs"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "263236519188-egm10tod1nbsmjf0gad6l9inkvcum930.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.boyfriend_needs",
+            "certificate_hash": "769837418b0f415b26464a0770c432f56b929f6e"
+          }
+        },
+        {
+          "client_id": "263236519188-hplgtdtc5qte6f97473jkoaolr24r2ms.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.boyfriend_needs",
+            "certificate_hash": "5e8f16062ea3cd2c4a0d547876baa6f38cabf625"
+          }
+        },
+        {
+          "client_id": "263236519188-o87q02kk1jrh4o0r6a5ffjfmpbrcd07j.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAK8uMv8rUCeFosB3yj7z-CmdazqF57zwA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "263236519188-o87q02kk1jrh4o0r6a5ffjfmpbrcd07j.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
