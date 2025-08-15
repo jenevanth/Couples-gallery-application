@@ -5,6 +5,7 @@
  * and then wraps the entire app in the ThemeProvider and Navigation.
  */
 import 'react-native-url-polyfill/auto'; // MUST BE THE FIRST IMPORT
+import { MenuProvider } from 'react-native-popup-menu';
 import React from 'react';
 import { StatusBar } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
@@ -13,12 +14,14 @@ import { ThemeProvider } from './src/theme/ThemeContext';
 
 const App = () => {
   return (
-    <ThemeProvider>
-      <NavigationContainer>
-        <StatusBar barStyle="light-content" backgroundColor="#121212" />
-        <AppNavigator />
-      </NavigationContainer>
-    </ThemeProvider>
+    <MenuProvider>
+      <ThemeProvider>
+        <NavigationContainer>
+          <StatusBar barStyle="light-content" backgroundColor="#121212" />
+          <AppNavigator />
+        </NavigationContainer>
+      </ThemeProvider>
+    </MenuProvider>
   );
 };
 

@@ -1,8 +1,3 @@
-/**
- * src/screens/AuthScreen.js
- * Handles user login using Supabase for Email/Password and Google Sign-In.
- * -- UPDATED WITH CONSOLE LOGS FOR DEBUGGING --
- */
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -18,7 +13,6 @@ import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import ThemedButton from '../components/ThemedButton';
 import { Svg, Path } from 'react-native-svg';
 
-// Inline SVG for the Google Icon - no external files needed
 const GoogleIcon = () => (
   <Svg height="24" width="24" viewBox="0 0 48 48">
     <Path
@@ -50,7 +44,7 @@ const AuthScreen = ({ navigation }) => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session) {
         console.log(
-          '[AuthScreen] Found active session, navigating to Gallery.',
+          '[AuthScreen] Found active session, navigating to MainTabs.',
         );
         navigation.replace('MainTabs');
       }
@@ -63,7 +57,7 @@ const AuthScreen = ({ navigation }) => {
         `[AuthScreen] Auth state changed. Session exists: ${!!session}`,
       );
       if (session) {
-        navigation.replace('Gallery');
+        navigation.replace('MainTabs');
       }
     });
 
@@ -101,6 +95,7 @@ const AuthScreen = ({ navigation }) => {
       Alert.alert('Sign In Error', error.message);
     } else {
       console.log('[AuthScreen] Sign In successful.');
+      navigation.replace('MainTabs');
     }
     setLoading(false);
   };
@@ -121,6 +116,7 @@ const AuthScreen = ({ navigation }) => {
         });
         if (error) throw error;
         console.log('[AuthScreen] Supabase Google Sign-In successful.');
+        navigation.replace('MainTabs');
       } else {
         throw new Error('No ID token received from Google.');
       }

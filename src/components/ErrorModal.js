@@ -5,7 +5,9 @@ import Modal from 'react-native-modal';
 const ErrorModal = ({ visible, message, onClose, theme }) => (
   <Modal isVisible={visible} onBackdropPress={onClose}>
     <View style={[styles.modal, { backgroundColor: theme.colors.light }]}>
-      <Text style={[styles.title, { color: theme.colors.primary }]}>Error</Text>
+      <Text style={[styles.title, { color: theme.colors.primary }]}>
+        Report
+      </Text>
       <Text style={styles.message}>{message}</Text>
       <TouchableOpacity
         style={[styles.button, { backgroundColor: theme.colors.primary }]}
