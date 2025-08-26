@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import {
   View,
   Text,
@@ -12,7 +18,10 @@ import {
   Image,
   Alert,
   Dimensions,
-  KeyboardAvoidingView,
+  RefreshControl,
+  TouchableWithoutFeedback,
+  UIManager,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
@@ -25,6 +34,7 @@ import Share from 'react-native-share';
 import BlobUtil from 'react-native-blob-util';
 import Icon from 'react-native-vector-icons/Ionicons';
 import Modal from 'react-native-modal';
+import Video from 'react-native-video';
 import { format, parseISO, isToday, isSameMonth, isSameWeek } from 'date-fns';
 import {
   Menu,
@@ -35,215 +45,380 @@ import {
 import CommentsSection from '../components/CommentsSection';
 import { useFocusEffect } from '@react-navigation/native';
 
+const log = (...a) => console.log('[Gallery]', ...a);
+
 const IMAGEKIT_LIMIT_GB = 19;
 const IMAGEKIT_PUBLIC_KEY = 'public_IAZdw7PGwJlYkHZC8/KN4/9TdRw=';
 
 const FILTERS = [
   { label: 'All', value: 'all' },
+  { label: 'Photos', value: 'photo' },
+  { label: 'Videos', value: 'video' },
+  { label: 'Favorites', value: 'favorites' },
   { label: 'This Month', value: 'month' },
   { label: 'This Week', value: 'week' },
 ];
 
 const { width } = Dimensions.get('window');
-const gridItemSize = (width - 48) / 2;
 
 const GalleryScreen = ({ navigation }) => {
   const { theme } = useTheme();
+
+  // Data
   const [images, setImages] = useState([]);
+  const [avatarUrl, setAvatarUrl] = useState('');
+  const [userId, setUserId] = useState('');
+
+  // UI state
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [isViewerVisible, setIsViewerVisible] = useState(false);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
-  const [selectedImage, setSelectedImage] = useState(null);
-  const [fetchError, setFetchError] = useState(null);
+
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
+
+  // Photo viewer
+  const [isViewerVisible, setIsViewerVisible] = useState(false);
+  const [photoViewerIndex, setPhotoViewerIndex] = useState(0); // index into photosOnly
+  const [showFooter, setShowFooter] = useState(true); // visible by default
+
+  // Video viewer
+  const [videoVisible, setVideoVisible] = useState(false);
+  const [videoUri, setVideoUri] = useState('');
+
+  // Item actions
+  const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
+  const [selectedImage, setSelectedImage] = useState(null);
+
+  // Comments
+  const [showComments, setShowComments] = useState(false);
+
+  // Multi-select
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [selectedIds, setSelectedIds] = useState([]);
+
+  // Status modals
   const [errorModal, setErrorModal] = useState({ visible: false, message: '' });
   const [successModal, setSuccessModal] = useState({
     visible: false,
     message: '',
   });
-  const [avatarUrl, setAvatarUrl] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-  const [userId, setUserId] = useState('');
 
-  // Debug log for every render
-  console.log('[GalleryScreen] Render', {
+  // Detect native video module (prevents RCTVideo crash)
+  const videoSupportedRef = useRef(false);
+  useEffect(() => {
+    try {
+      const cfg = UIManager.getViewManagerConfig
+        ? UIManager.getViewManagerConfig('RCTVideo')
+        : UIManager.RCTVideo;
+      videoSupportedRef.current = !!cfg;
+      log('RCTVideo available:', !!cfg);
+    } catch (e) {
+      log('RCTVideo VM lookup error:', e);
+      videoSupportedRef.current = false;
+    }
+  }, []);
+
+  log('Render', {
     loading,
-    imagesCount: images.length,
+    count: images.length,
     search,
     filter,
+    multiSelect,
+    selectedIdsLen: selectedIds.length,
+    uploading,
+    progress,
   });
 
-  // Fetch profile avatar for header
-  useEffect(() => {
-    const fetchProfileAvatar = async () => {
+  // Load auth + avatar
+  const fetchProfileAvatar = useCallback(async () => {
+    try {
       const {
         data: { user },
+        error,
       } = await supabase.auth.getUser();
+      if (error) log('getUser error:', error);
       if (!user) return;
       setUserId(user.id);
-      let { data, error } = await supabase
+      const { data, error: pErr } = await supabase
         .from('profiles')
         .select('avatar_url')
         .eq('id', user.id)
-        .single();
-      if (data && data.avatar_url) setAvatarUrl(data.avatar_url);
-      else setAvatarUrl('');
-      console.log('[GalleryScreen] Loaded avatar:', data?.avatar_url);
-    };
-    fetchProfileAvatar();
+        .maybeSingle();
+      if (pErr) log('profile fetch error:', pErr);
+      setAvatarUrl(data?.avatar_url || '');
+      log('Loaded avatar:', data?.avatar_url);
+    } catch (e) {
+      log('fetchProfileAvatar exception:', e);
+    }
   }, []);
 
-  // Fetch images from Supabase
+  useEffect(() => {
+    fetchProfileAvatar();
+  }, [fetchProfileAvatar]);
+
+  useFocusEffect(
+    useCallback(() => {
+      fetchProfileAvatar();
+    }, [fetchProfileAvatar]),
+  );
+
+  // Fetch images
   const fetchImages = useCallback(async () => {
-    console.log('[GalleryScreen] --- Fetching images from Supabase... ---');
-    setLoading(true);
-    setFetchError(null);
-    const { data, error } = await supabase
-      .from('images')
-      .select('*')
-      .order('created_at', { ascending: false });
-    if (error) {
-      setFetchError(error.message);
-      setErrorModal({ visible: true, message: error.message });
-      setImages([]);
-    } else {
+    try {
+      log('--- Fetching images from Supabase... ---');
+      setLoading(true);
+      const { data, error } = await supabase
+        .from('images')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (error) throw error;
       setImages(data || []);
-      console.log(
-        '[GalleryScreen] Supabase fetch success. Images:',
-        data?.length,
-        data,
-      );
+      log('Supabase fetch success. Images count:', data?.length);
+    } catch (e) {
+      log('Fetch error:', e);
+      setErrorModal({ visible: true, message: e.message || String(e) });
+      setImages([]);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+      log('--- Fetching images complete ---');
     }
-    setLoading(false);
-    setRefreshing(false);
   }, []);
 
   useEffect(() => {
     fetchImages();
-    const imagesChannel = supabase
+    const ch = supabase
       .channel('public:images')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'images' },
         payload => {
-          console.log(
-            '[GalleryScreen] --- Supabase real-time event received ---',
+          log(
+            'Realtime event:',
             payload.eventType,
+            payload.new?.id || payload.old?.id,
           );
           fetchImages();
         },
       )
       .subscribe();
     return () => {
-      supabase.removeChannel(imagesChannel);
+      supabase.removeChannel(ch);
+      log('Realtime channel removed: public:images');
     };
   }, [fetchImages]);
 
-  // Group images by date
-  const groupImagesByDate = imagesArr => {
+  // Group by date
+  const groupImagesByDate = useCallback(arr => {
     const groups = {};
-    imagesArr.forEach(img => {
+    for (const img of arr) {
       const date = format(parseISO(img.created_at), 'yyyy-MM-dd');
       if (!groups[date]) groups[date] = [];
       groups[date].push(img);
-    });
+    }
     return groups;
-  };
+  }, []);
 
-  // Filter images by search and filter
-  const getFilteredImages = () => {
-    let filtered = images;
+  // Filters
+  const filteredImages = useMemo(() => {
+    let list = images;
     if (search) {
-      filtered = filtered.filter(
+      const q = search.toLowerCase();
+      list = list.filter(
         img =>
-          (img.image_url &&
-            img.image_url.toLowerCase().includes(search.toLowerCase())) ||
-          (img.file_name &&
-            img.file_name.toLowerCase().includes(search.toLowerCase())),
+          img.image_url?.toLowerCase().includes(q) ||
+          img.file_name?.toLowerCase().includes(q),
       );
     }
-    if (filter === 'month') {
-      filtered = filtered.filter(img =>
+    if (filter === 'photo') list = list.filter(img => img.type === 'photo');
+    else if (filter === 'video')
+      list = list.filter(img => img.type === 'video');
+    else if (filter === 'favorites') list = list.filter(img => img.favorite);
+    else if (filter === 'month')
+      list = list.filter(img =>
         isSameMonth(parseISO(img.created_at), new Date()),
       );
-    } else if (filter === 'week') {
-      filtered = filtered.filter(img =>
+    else if (filter === 'week')
+      list = list.filter(img =>
         isSameWeek(parseISO(img.created_at), new Date(), { weekStartsOn: 1 }),
       );
-    }
-    return filtered;
-  };
+    return list;
+  }, [images, search, filter]);
 
-  // Upload handler (ImageKit until full, then Cloudinary)
+  const photosOnly = useMemo(
+    () => filteredImages.filter(i => i.type !== 'video'),
+    [filteredImages],
+  );
+
+  const groupedImages = useMemo(
+    () => groupImagesByDate(filteredImages),
+    [filteredImages, groupImagesByDate],
+  );
+
+  // Upload handler
   const handleImagePickAndUpload = () => {
+    log('Launching image library picker...');
     launchImageLibrary(
-      { mediaType: 'photo', selectionLimit: 0 },
+      { mediaType: 'mixed', selectionLimit: 0 },
       async response => {
-        if (response.didCancel) return;
-        if (response.errorCode) {
-          setErrorModal({ visible: true, message: response.errorMessage });
-          return;
+        log('Picker response:', {
+          didCancel: response?.didCancel,
+          errorCode: response?.errorCode,
+          assetsLen: response?.assets?.length,
+          platform: Platform.OS,
+        });
+        if (response?.didCancel) return;
+        if (response?.errorCode) {
+          return setErrorModal({
+            visible: true,
+            message: response.errorMessage || 'Picker error',
+          });
         }
-        const assets = response.assets;
-        if (!assets || assets.length === 0) return;
-        setUploading(true);
-        let successCount = 0;
-        const usageRes = await fetch(
-          'https://boyfriend-needs-backend.vercel.app/api/imagekit-usage',
-        );
-        const usage = await usageRes.json();
-        const useImageKit = usage.totalGB < IMAGEKIT_LIMIT_GB;
-        for (let i = 0; i < assets.length; i++) {
-          const asset = assets[i];
-          setProgress(0);
-          try {
-            let uploadUrl = '',
-              storageType = '';
+        const assets = response?.assets;
+        if (!assets?.length) return;
+
+        try {
+          setUploading(true);
+          let successCount = 0;
+
+          log('Checking ImageKit usage limit...');
+          const usageRes = await fetch(
+            'https://boyfriend-needs-backend.vercel.app/api/imagekit-usage',
+          );
+          const usage = await usageRes.json();
+          const useImageKit = usage?.totalGB < IMAGEKIT_LIMIT_GB;
+          log('Usage response:', usage);
+          log('Upload will use:', useImageKit ? 'ImageKit' : 'Cloudinary');
+
+          const {
+            data: { user },
+          } = await supabase.auth.getUser();
+          log('Auth user fetched for upload:', !!user, user?.id);
+          if (!user) {
+            setErrorModal({
+              visible: true,
+              message: 'You are not logged in. Please log in again.',
+            });
+            setUploading(false);
+            return;
+          }
+
+          for (let i = 0; i < assets.length; i++) {
+            const asset = assets[i];
+            log(`[${i + 1}/${assets.length}] Processing asset:`, {
+              fileName: asset.fileName,
+              type: asset.type,
+              uri: asset.uri,
+              fileSize: asset.fileSize,
+              width: asset.width,
+              height: asset.height,
+            });
+
+            setProgress(0);
+            const isVideo = asset.type?.startsWith('video');
+            const type = isVideo ? 'video' : 'photo';
+
+            let uploadUrl = '';
+            let storageType = '';
+
             if (useImageKit) {
-              const signatureData = await fetch(
-                'https://boyfriend-needs-backend.vercel.app/api/imagekit-auth',
-              ).then(res => res.json());
-              const uploadData = [
-                {
-                  name: 'file',
-                  filename: asset.fileName,
-                  data: BlobUtil.wrap(asset.uri.replace('file://', '')),
-                },
-                { name: 'publicKey', data: IMAGEKIT_PUBLIC_KEY },
-                { name: 'signature', data: signatureData.signature },
-                { name: 'expire', data: String(signatureData.expire) },
-                { name: 'token', data: signatureData.token },
-                { name: 'fileName', data: asset.fileName },
-              ];
-              const task = BlobUtil.fetch(
-                'POST',
-                'https://upload.imagekit.io/api/v1/files/upload',
-                { 'Content-Type': 'multipart/form-data' },
-                uploadData,
-              );
-              task.uploadProgress((written, total) =>
-                setProgress(Math.round((written / total) * 100)),
-              );
-              const uploadResult = await task;
-              const resultJson = uploadResult.json();
-              if (uploadResult.info().status >= 300)
-                throw new Error(resultJson.message || 'ImageKit upload failed');
-              uploadUrl = resultJson.url;
-              storageType = 'imagekit';
-              console.log(
-                '[GalleryScreen] ImageKit upload success:',
-                uploadUrl,
-              );
+              try {
+                log(
+                  `[${i + 1}/${assets.length}] Getting ImageKit signature...`,
+                );
+                const signatureData = await fetch(
+                  'https://boyfriend-needs-backend.vercel.app/api/imagekit-auth',
+                ).then(res => res.json());
+                log('ImageKit signature received.');
+
+                const fileName = asset.fileName || `media_${Date.now()}_${i}`;
+                const wrappedPath = BlobUtil.wrap(
+                  (asset.uri || '').startsWith('file://')
+                    ? asset.uri.replace('file://', '')
+                    : asset.uri || '',
+                );
+                const uploadData = [
+                  { name: 'file', filename: fileName, data: wrappedPath },
+                  { name: 'publicKey', data: IMAGEKIT_PUBLIC_KEY },
+                  { name: 'signature', data: signatureData.signature },
+                  { name: 'expire', data: String(signatureData.expire) },
+                  { name: 'token', data: signatureData.token },
+                  { name: 'fileName', data: fileName },
+                ];
+
+                log(`[${i + 1}/${assets.length}] Uploading to ImageKit...`);
+                const tStart = Date.now();
+                const task = BlobUtil.fetch(
+                  'POST',
+                  'https://upload.imagekit.io/api/v1/files/upload',
+                  {},
+                  uploadData,
+                );
+                task.uploadProgress((written, total) => {
+                  const pct =
+                    total > 0 ? Math.round((written / total) * 100) : 0;
+                  setProgress(pct);
+                });
+
+                const uploadResult = await task;
+                const resultJson = uploadResult.json();
+                const status = uploadResult.info().status;
+                log('ImageKit upload HTTP status:', status);
+                if (status >= 300)
+                  throw new Error(
+                    resultJson?.message || 'ImageKit upload failed',
+                  );
+
+                uploadUrl = resultJson.url;
+                storageType = 'imagekit';
+                log(
+                  'ImageKit upload success:',
+                  uploadUrl,
+                  'timeMs:',
+                  Date.now() - tStart,
+                );
+              } catch (e) {
+                log(
+                  'ImageKit upload error, falling back to Cloudinary:',
+                  e?.message || e,
+                );
+                const fileBase64 = await BlobUtil.fs.readFile(
+                  (asset.uri || '').replace('file://', ''),
+                  'base64',
+                );
+                log('Uploading to Cloudinary...');
+                const tStart = Date.now();
+                const cloudRes = await fetch(
+                  'https://boyfriend-needs-backend.vercel.app/api/cloudinary-upload',
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      fileBase64: `data:${asset.type};base64,${fileBase64}`,
+                    }),
+                  },
+                );
+                const cloudJson = await cloudRes.json();
+                if (!cloudJson.url) throw new Error('Cloudinary upload failed');
+                uploadUrl = cloudJson.url;
+                storageType = 'cloudinary';
+                log(
+                  'Cloudinary upload success:',
+                  uploadUrl,
+                  'timeMs:',
+                  Date.now() - tStart,
+                );
+              }
             } else {
+              log('Directly uploading to Cloudinary (usage limit reached)...');
               const fileBase64 = await BlobUtil.fs.readFile(
-                asset.uri.replace('file://', ''),
+                (asset.uri || '').replace('file://', ''),
                 'base64',
               );
+              const tStart = Date.now();
               const cloudRes = await fetch(
                 'https://boyfriend-needs-backend.vercel.app/api/cloudinary-upload',
                 {
@@ -258,207 +433,343 @@ const GalleryScreen = ({ navigation }) => {
               if (!cloudJson.url) throw new Error('Cloudinary upload failed');
               uploadUrl = cloudJson.url;
               storageType = 'cloudinary';
-              console.log(
-                '[GalleryScreen] Cloudinary upload success:',
+              log(
+                'Cloudinary upload success:',
                 uploadUrl,
+                'timeMs:',
+                Date.now() - tStart,
               );
             }
-            // Save to Supabase
-            const {
-              data: { user },
-              error: userError,
-            } = await supabase.auth.getUser();
-            console.log('[GalleryScreen] Supabase user:', user, userError);
 
-            if (!user) {
-              setErrorModal({
-                visible: true,
-                message: 'You are not logged in. Please log in again.',
-              });
-              setUploading(false);
-              return;
-            }
+            // Insert row
+            log('Inserting row into Supabase images table...', {
+              user_id: user.id,
+              type,
+              storageType,
+              fileName: asset.fileName || '',
+              uploadUrl,
+            });
 
-            const { error: supabaseError } = await supabase
+            const { data: inserted, error: sErr } = await supabase
               .from('images')
               .insert({
                 user_id: user.id,
                 image_url: uploadUrl,
                 storage_type: storageType,
                 created_at: new Date().toISOString(),
-                file_name: asset.fileName,
+                file_name: asset.fileName || '',
                 favorite: false,
+                type,
+                private: false,
+              })
+              .select('*')
+              .single();
+
+            if (sErr || !inserted) {
+              log('Supabase insert error:', sErr, 'inserted:', inserted);
+              setErrorModal({
+                visible: true,
+                message: sErr?.message || 'Insert failed',
               });
-
-            console.log(
-              '[GalleryScreen] Supabase insert error:',
-              supabaseError,
-            );
-
-            if (supabaseError) {
-              setErrorModal({ visible: true, message: supabaseError.message });
               break;
             }
+
+            log('Supabase insert success. Inserted row:', inserted);
+
+            // Edge Function: push notification for new image
+            try {
+              log(
+                'Invoking edge function push-new-image-v1 with image_id:',
+                inserted.id,
+              );
+              const tFn = Date.now();
+              const { data: fnRes, error: fnErr } =
+                await supabase.functions.invoke('push-new-image-v1', {
+                  body: { image_id: inserted.id },
+                });
+              const fnMs = Date.now() - tFn;
+              if (fnErr) {
+                log(
+                  'Edge function push-new-image-v1 ERROR:',
+                  fnErr,
+                  'durationMs:',
+                  fnMs,
+                );
+              } else {
+                log(
+                  'Edge function push-new-image-v1 OK. Response:',
+                  fnRes,
+                  'durationMs:',
+                  fnMs,
+                );
+              }
+            } catch (fnCatch) {
+              log('Edge function invoke exception:', fnCatch);
+            }
+
             successCount++;
-          } catch (e) {
-            setErrorModal({ visible: true, message: e.message });
-            break;
+            log(
+              `[${i + 1}/${assets.length}] Completed upload+insert${
+                isVideo ? ' (video)' : ' (photo)'
+              }. image_id:`,
+              inserted.id,
+            );
           }
+
+          if (successCount > 0) {
+            setSuccessModal({
+              visible: true,
+              message: `${successCount} file(s) uploaded!`,
+            });
+            log('Refreshing images after uploads...');
+            fetchImages();
+          } else {
+            log('No successful uploads.');
+          }
+        } catch (e) {
+          log('Upload exception:', e);
+          setErrorModal({ visible: true, message: e.message || String(e) });
+        } finally {
+          setUploading(false);
+          setProgress(0);
+          log('Upload flow finished. uploading=false');
         }
-        setUploading(false);
-        if (successCount > 0) {
-          setSuccessModal({
-            visible: true,
-            message: `${successCount} photo(s) uploaded!`,
-          });
-        }
-        fetchImages();
       },
     );
   };
 
-  const handleSignOut = async () => {
-    await supabase.auth.signOut();
-    navigation.replace('Auth');
-  };
-
   const onRefresh = () => {
     setRefreshing(true);
+    log('Pull-to-refresh triggered.');
     fetchImages();
   };
 
-  const openImage = index => {
-    setCurrentIndex(index);
-    setIsViewerVisible(true);
-  };
-
-  const openDeleteModal = image => {
-    setSelectedImage(image);
-    setIsDeleteModalVisible(true);
-    console.log('[GalleryScreen] Opened delete modal for image:', image.id);
-  };
-
-  const handleDelete = async () => {
-    if (!selectedImage) return;
-    try {
-      const { error } = await supabase
-        .from('images')
-        .delete()
-        .eq('id', selectedImage.id);
-      if (error) {
-        setErrorModal({ visible: true, message: error.message });
+  // Open
+  const openItem = item => {
+    log('Open item requested:', { id: item.id, type: item.type });
+    if (multiSelect) {
+      toggleSelect(item.id);
+      return;
+    }
+    if (item.type === 'video') {
+      if (videoSupportedRef.current) {
+        setVideoUri(item.image_url);
+        setVideoVisible(true);
+        log('Open video viewer for id:', item.id);
       } else {
-        setIsDeleteModalVisible(false);
-        setSelectedImage(null);
-        fetchImages();
-        console.log('[GalleryScreen] Deleted image:', selectedImage.id);
+        log('RCTVideo not available. Opening external player.');
+        Alert.alert(
+          'Opening externally',
+          'Native video module missing; opening in external player.',
+        );
+        Linking.openURL(item.image_url);
       }
+    } else {
+      const idx = photosOnly.findIndex(p => p.id === item.id);
+      setPhotoViewerIndex(Math.max(0, idx));
+      setIsViewerVisible(true);
+      setShowFooter(true);
+      setShowComments(false);
+      log('Open photo viewer for id:', item.id, 'photoIndex:', idx);
+    }
+  };
+
+  // Single delete (from viewer footer)
+  const deleteCurrentPhoto = async () => {
+    const img = photosOnly[photoViewerIndex];
+    if (!img) return;
+    log('Delete current photo requested:', img.id);
+    Alert.alert('Delete', 'Delete this photo?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          const { error } = await supabase
+            .from('images')
+            .delete()
+            .eq('id', img.id);
+          if (error) {
+            setErrorModal({ visible: true, message: error.message });
+            log('Delete error:', error);
+          } else {
+            setIsViewerVisible(false);
+            fetchImages();
+            log('Deleted photo id:', img.id);
+          }
+        },
+      },
+    ]);
+  };
+
+  const handleShareCurrent = async () => {
+    try {
+      const img = photosOnly[photoViewerIndex];
+      if (!img) return;
+      await Share.open({ url: img.image_url });
+      log('Shared photo:', img.image_url);
     } catch (e) {
+      log('Share error:', e);
       setErrorModal({ visible: true, message: e.message });
     }
   };
 
-  const handleShare = async () => {
+  const handleSaveCurrent = async () => {
     try {
-      const image = getFilteredImages()[currentIndex];
-      if (!image) return;
-      await Share.open({ url: image.image_url });
-      console.log('[GalleryScreen] Shared image:', image.image_url);
-    } catch (e) {
-      setErrorModal({ visible: true, message: e.message });
-    }
-  };
-
-  const handleSave = async () => {
-    try {
-      const image = getFilteredImages()[currentIndex];
-      if (!image) return;
-      const fileUrl = image.image_url;
+      const img = photosOnly[photoViewerIndex];
+      if (!img) return;
+      const fileUrl = img.image_url;
       const fileName = fileUrl.split('/').pop();
       const dirs = BlobUtil.fs.dirs;
-      const downloadDest =
+      const dest =
         Platform.OS === 'android'
           ? `${dirs.DownloadDir}/${fileName}`
           : `${dirs.DocumentDir}/${fileName}`;
-      await BlobUtil.config({ path: downloadDest }).fetch('GET', fileUrl);
-      setSuccessModal({
-        visible: true,
-        message: 'Image saved to your device.',
-      });
-      console.log('[GalleryScreen] Saved image to device:', downloadDest);
+      log('Saving file to device...', { dest, fileUrl });
+      await BlobUtil.config({ path: dest }).fetch('GET', fileUrl);
+      setSuccessModal({ visible: true, message: 'Saved to device.' });
+      log('Saved file to:', dest);
     } catch (e) {
+      log('Save error:', e);
       setErrorModal({ visible: true, message: e.message });
     }
   };
 
-  const handleToggleFavorite = async image => {
+  const toggleFavoriteCurrent = async () => {
+    const img = photosOnly[photoViewerIndex];
+    if (!img) return;
     try {
-      const updated = !image.favorite;
+      const updated = !img.favorite;
       await supabase
         .from('images')
         .update({ favorite: updated })
-        .eq('id', image.id);
+        .eq('id', img.id);
       setImages(prev =>
-        prev.map(img =>
-          img.id === image.id ? { ...img, favorite: updated } : img,
-        ),
+        prev.map(i => (i.id === img.id ? { ...i, favorite: updated } : i)),
       );
-      console.log(
-        '[GalleryScreen] Toggled favorite for image:',
-        image.id,
-        'Now:',
-        updated,
-      );
+      log('Toggled favorite id:', img.id, '->', updated);
     } catch (e) {
       setErrorModal({ visible: true, message: e.message });
+      log('Toggle favorite error:', e);
     }
   };
 
-  // Render each date section
-  const renderSection = (date, imagesArr) => (
-    <View key={date} style={styles.section}>
-      <View style={styles.sectionHeader}>
-        <Text style={styles.sectionTitle}>
-          {isToday(parseISO(date))
-            ? 'Today'
-            : format(parseISO(date), 'MMMM d, yyyy')}
-        </Text>
-        <TouchableOpacity
-          onPress={() =>
-            navigation.navigate('DayGallery', { date, images: imagesArr })
-          }
-        >
-          <Text style={styles.seeAll}>See All</Text>
-        </TouchableOpacity>
-      </View>
-      <FlatList
-        data={imagesArr}
-        numColumns={2}
-        keyExtractor={item => item.id.toString()}
-        renderItem={({ item, index }) => (
-          <PhotoGridItem
-            image={item}
-            onPress={() => {
-              const idx = getFilteredImages().findIndex(
-                img => img.id === item.id,
-              );
-              setCurrentIndex(idx);
-              setIsViewerVisible(true);
-              console.log(
-                '[GalleryScreen] Opened viewer for image:',
-                item.id,
-                'at index',
-                idx,
-              );
-            }}
-          />
-        )}
-        scrollEnabled={false}
-      />
-    </View>
-  );
+  // Multi-select helpers
+  const toggleSelect = id => {
+    setSelectedIds(prev =>
+      prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id],
+    );
+    log('Toggle select id:', id);
+  };
 
-  // UI rendering
+  const startMultiSelect = id => {
+    if (!multiSelect) setMultiSelect(true);
+    toggleSelect(id);
+    log('Multi-select start/toggle id:', id);
+  };
+
+  const handleBatchDelete = async () => {
+    if (!selectedIds.length) return;
+    log('Batch delete requested count:', selectedIds.length);
+    Alert.alert('Delete', `Delete ${selectedIds.length} item(s)?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          await supabase.from('images').delete().in('id', selectedIds);
+          setSelectedIds([]);
+          setMultiSelect(false);
+          fetchImages();
+          log('Batch deleted count:', selectedIds.length);
+        },
+      },
+    ]);
+  };
+
+  const handleBatchShare = async () => {
+    if (!selectedIds.length) return;
+    const urls = images
+      .filter(i => selectedIds.includes(i.id))
+      .map(i => i.image_url);
+    try {
+      await Share.open({ urls });
+      log('Batch share urls:', urls.length);
+    } catch (e) {
+      log('Batch share error/cancel:', e?.message || e);
+    }
+  };
+
+  const handleBatchFavoriteToggle = async () => {
+    if (!selectedIds.length) return;
+    try {
+      const selectedItems = images.filter(i => selectedIds.includes(i.id));
+      const makeFav = selectedItems.some(i => !i.favorite);
+      await supabase
+        .from('images')
+        .update({ favorite: makeFav })
+        .in('id', selectedIds);
+      setImages(prev =>
+        prev.map(i =>
+          selectedIds.includes(i.id) ? { ...i, favorite: makeFav } : i,
+        ),
+      );
+      log('Batch favorite ->', makeFav, 'count:', selectedIds.length);
+    } catch (e) {
+      setErrorModal({ visible: true, message: e.message });
+      log('Batch favorite error:', e);
+    }
+  };
+
+  const handleSelectAll = () => {
+    const ids = filteredImages.map(i => i.id);
+    setSelectedIds(ids);
+    setMultiSelect(true);
+    log('Selected all:', ids.length);
+  };
+
+  // Render each date section
+  const renderSection = (date, imagesArr) => {
+    const showSeeAll = imagesArr.length > 4;
+    const imagesToShow = showSeeAll ? imagesArr.slice(0, 4) : imagesArr;
+
+    return (
+      <View key={date} style={styles.section}>
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>
+            {isToday(parseISO(date))
+              ? 'Today'
+              : format(parseISO(date), 'MMMM d, yyyy')}
+          </Text>
+          {showSeeAll && (
+            <TouchableOpacity
+              onPress={() =>
+                navigation.navigate('DayGallery', { date, images: imagesArr })
+              }
+            >
+              <Text style={styles.seeAll}>See All</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        <FlatList
+          data={imagesToShow}
+          numColumns={2}
+          keyExtractor={item => item.id.toString()}
+          renderItem={({ item }) => (
+            <PhotoGridItem
+              image={item}
+              onPress={() => openItem(item)}
+              onLongPress={() => startMultiSelect(item.id)}
+              selected={selectedIds.includes(item.id)}
+              showSelect={multiSelect}
+            />
+          )}
+          scrollEnabled={false}
+        />
+      </View>
+    );
+  };
+
   if (loading) {
     return (
       <SafeAreaView style={styles.loader}>
@@ -470,23 +781,6 @@ const GalleryScreen = ({ navigation }) => {
     );
   }
 
-  if (fetchError) {
-    return (
-      <SafeAreaView style={styles.loader}>
-        <Text style={{ color: 'red', marginBottom: 10 }}>
-          Error: {fetchError}
-        </Text>
-        <TouchableOpacity onPress={fetchImages} style={styles.fab}>
-          <Text style={styles.fabIcon}>⟳</Text>
-        </TouchableOpacity>
-      </SafeAreaView>
-    );
-  }
-
-  // Group and filter images
-  const filteredImages = getFilteredImages();
-  const groupedImages = groupImagesByDate(filteredImages);
-
   return (
     <SafeAreaView
       style={[
@@ -494,7 +788,7 @@ const GalleryScreen = ({ navigation }) => {
         { backgroundColor: theme.colors.primary + '20' },
       ]}
     >
-      {/* Header with Profile Avatar and Dropdown Menu */}
+      {/* Header */}
       <View style={styles.header}>
         <TouchableOpacity onPress={() => navigation.navigate('Profile')}>
           <Image
@@ -516,39 +810,24 @@ const GalleryScreen = ({ navigation }) => {
             />
           </MenuTrigger>
           <MenuOptions>
-            <MenuOption
-              onSelect={() => {
-                navigation.navigate('SharedCalendar');
-                console.log('[GalleryScreen] Menu: Shared Calendar');
-              }}
-            >
+            <MenuOption onSelect={() => navigation.navigate('SharedCalendar')}>
               <Text style={styles.menuOption}>Shared Calendar</Text>
             </MenuOption>
-            <MenuOption
-              onSelect={() => {
-                navigation.navigate('ThemesStickers');
-                console.log('[GalleryScreen] Menu: Themes & Stickers');
-              }}
-            >
-              <Text style={styles.menuOption}>Themes & Stickers</Text>
-            </MenuOption>
-            <MenuOption
-              onSelect={() => {
-                navigation.navigate('PrivateChat');
-                console.log('[GalleryScreen] Menu: Private Chat');
-              }}
-            >
+            <MenuOption onSelect={() => navigation.navigate('PrivateChat')}>
               <Text style={styles.menuOption}>Private Chat</Text>
             </MenuOption>
-            <MenuOption
-              onSelect={() => {
-                navigation.navigate('PhotoVault');
-                console.log('[GalleryScreen] Menu: Photo Vault');
-              }}
-            >
+            <MenuOption onSelect={() => navigation.navigate('PhotoVault')}>
               <Text style={styles.menuOption}>Photo Vault</Text>
             </MenuOption>
-            <MenuOption onSelect={handleSignOut}>
+            <MenuOption
+              onSelect={async () => {
+                await supabase.auth.signOut();
+                navigation.reset({
+                  index: 0,
+                  routes: [{ name: 'ProfileSelector' }],
+                });
+              }}
+            >
               <Text style={[styles.menuOption, { color: '#FF6347' }]}>
                 Sign Out
               </Text>
@@ -556,7 +835,60 @@ const GalleryScreen = ({ navigation }) => {
           </MenuOptions>
         </Menu>
       </View>
-      {/* Search Bar with Filter */}
+
+      {/* Multi-select bar */}
+      {multiSelect && (
+        <View style={styles.multiSelectBar}>
+          <Text style={{ color: theme.colors.primary, fontWeight: 'bold' }}>
+            {selectedIds.length} selected
+          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <TouchableOpacity
+              onPress={handleBatchShare}
+              style={{ marginHorizontal: 8 }}
+            >
+              <Icon
+                name="share-social-outline"
+                size={22}
+                color={theme.colors.primary}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={handleBatchFavoriteToggle}
+              style={{ marginHorizontal: 8 }}
+            >
+              <Icon name="heart" size={22} color="#FF80AB" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={handleBatchDelete}
+              style={{ marginHorizontal: 8 }}
+            >
+              <Icon name="trash" size={22} color="#FF6347" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={handleSelectAll}
+              style={{ marginHorizontal: 8 }}
+            >
+              <Icon
+                name="checkmark-done"
+                size={22}
+                color={theme.colors.primary}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => {
+                setMultiSelect(false);
+                setSelectedIds([]);
+              }}
+              style={{ marginHorizontal: 8 }}
+            >
+              <Icon name="close" size={22} color="#888" />
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* Search + Filter + toggle */}
       <View style={styles.searchBar}>
         <Icon name="search" size={20} color="#aaa" />
         <TextInput
@@ -564,17 +896,26 @@ const GalleryScreen = ({ navigation }) => {
           placeholder="Search by file or date"
           placeholderTextColor="#aaa"
           value={search}
-          onChangeText={text => {
-            setSearch(text);
-            console.log('[GalleryScreen] Search changed:', text);
+          onChangeText={t => {
+            setSearch(t);
+            log('Search changed:', t);
           }}
         />
-        <TouchableOpacity
-          onPress={() => setShowFilterDropdown(!showFilterDropdown)}
-        >
+        <TouchableOpacity onPress={() => setShowFilterDropdown(v => !v)}>
           <Icon name="filter" size={22} color={theme.colors.primary} />
         </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => setMultiSelect(v => !v)}
+          style={{ marginLeft: 8 }}
+        >
+          <Icon
+            name={multiSelect ? 'checkbox' : 'checkbox-outline'}
+            size={22}
+            color={theme.colors.primary}
+          />
+        </TouchableOpacity>
       </View>
+
       {/* Filter Dropdown */}
       {showFilterDropdown && (
         <View style={styles.dropdown}>
@@ -590,7 +931,7 @@ const GalleryScreen = ({ navigation }) => {
               onPress={() => {
                 setFilter(f.value);
                 setShowFilterDropdown(false);
-                console.log('[GalleryScreen] Filter set to:', f.value);
+                log('Filter set to:', f.value);
               }}
             >
               <Text
@@ -605,16 +946,24 @@ const GalleryScreen = ({ navigation }) => {
           ))}
         </View>
       )}
-      {/* Date sections */}
-      <ScrollView contentContainerStyle={{ paddingBottom: 120 }}>
+
+      {/* Sections */}
+      <ScrollView
+        contentContainerStyle={{ paddingBottom: 120 }}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+      >
         {Object.keys(groupedImages).map(date =>
           renderSection(date, groupedImages[date]),
         )}
       </ScrollView>
+
       {/* Upload FAB */}
       <TouchableOpacity style={styles.fab} onPress={handleImagePickAndUpload}>
         <Icon name="add" size={30} color="#fff" />
       </TouchableOpacity>
+
       {/* Upload Progress */}
       {uploading && (
         <View style={styles.uploadStatus}>
@@ -622,89 +971,120 @@ const GalleryScreen = ({ navigation }) => {
           <Text style={styles.uploadText}>Uploading... {progress}%</Text>
         </View>
       )}
-      {/* Image Viewer */}
+
+      {/* Photo Viewer */}
       <ImageViewing
-        images={filteredImages.map(img => ({ uri: img.image_url }))}
-        imageIndex={currentIndex}
+        images={photosOnly.map(img => ({ uri: img.image_url }))}
+        imageIndex={photoViewerIndex}
         visible={isViewerVisible}
         onRequestClose={() => setIsViewerVisible(false)}
+        doubleTapToZoomEnabled
+        swipeToCloseEnabled
+        onImageIndexChange={() => {
+          setShowFooter(true);
+          setShowComments(false);
+        }}
+        imageContainerStyle={{ marginBottom: showFooter ? 180 : 0 }}
         FooterComponent={() => {
-          const image = filteredImages[currentIndex];
-          if (!image) return null;
+          const img = photosOnly[photoViewerIndex];
+          if (!img) return null;
           return (
             <View>
               <View style={styles.viewerFooter}>
                 <TouchableOpacity
                   style={styles.viewerButton}
-                  onPress={handleShare}
+                  onPress={handleShareCurrent}
                 >
                   <Icon name="share-social-outline" size={22} color="#fff" />
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.viewerButton}
-                  onPress={handleSave}
+                  onPress={handleSaveCurrent}
                 >
                   <Icon name="download-outline" size={22} color="#fff" />
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.viewerButton}
-                  onPress={() => handleToggleFavorite(image)}
+                  onPress={toggleFavoriteCurrent}
                 >
                   <Icon
-                    name={image.favorite ? 'heart' : 'heart-outline'}
+                    name={img.favorite ? 'heart' : 'heart-outline'}
                     size={22}
                     color="#FF80AB"
                   />
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={styles.viewerButton}
-                  onPress={() => openDeleteModal(image)}
+                  onPress={deleteCurrentPhoto}
                 >
                   <Icon name="trash-outline" size={22} color="#FF6347" />
                 </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.viewerButton}
+                  onPress={() => setShowComments(v => !v)}
+                >
+                  <Icon
+                    name="chatbubble-ellipses-outline"
+                    size={22}
+                    color="#fff"
+                  />
+                </TouchableOpacity>
               </View>
-              <CommentsSection
-                imageId={image.id}
-                userId={userId}
-                theme={theme}
-              />
+              {showComments && (
+                <CommentsSection
+                  imageId={img.id}
+                  userId={userId}
+                  theme={theme}
+                />
+              )}
             </View>
           );
         }}
       />
-      {/* Delete Modal */}
-      <Modal isVisible={isDeleteModalVisible}>
-        <View style={styles.modalContent}>
-          <Text
+
+      {/* Video Viewer (dedicated) */}
+      <Modal
+        isVisible={videoVisible}
+        onBackdropPress={() => setVideoVisible(false)}
+        onBackButtonPress={() => setVideoVisible(false)}
+        style={{ margin: 0 }}
+        useNativeDriver
+        hideModalContentWhileAnimating
+      >
+        <View style={{ flex: 1, backgroundColor: '#000' }}>
+          <Video
+            source={{ uri: videoUri }}
+            style={{ width: '100%', height: '100%' }}
+            controls
+            paused={false}
+            resizeMode="contain"
+            onError={e => log('Video error:', e)}
+            onLoad={meta => log('Video loaded duration:', meta.duration)}
+            posterResizeMode="cover"
+          />
+          <TouchableOpacity
+            onPress={() => setVideoVisible(false)}
             style={{
-              color: theme.colors.primary,
-              fontSize: 18,
-              marginBottom: 20,
+              position: 'absolute',
+              top: 20,
+              right: 20,
+              backgroundColor: 'rgba(0,0,0,0.5)',
+              padding: 8,
+              borderRadius: 18,
             }}
           >
-            Are you sure you want to delete this photo?
-          </Text>
-          <View style={{ flexDirection: 'row' }}>
-            <TouchableOpacity style={styles.modalButton} onPress={handleDelete}>
-              <Text style={{ color: '#fff' }}>Delete</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.modalButton}
-              onPress={() => setIsDeleteModalVisible(false)}
-            >
-              <Text style={{ color: '#fff' }}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
+            <Icon name="close" size={22} color="#fff" />
+          </TouchableOpacity>
         </View>
       </Modal>
-      {/* Error Modal */}
+
+      {/* Error & Success */}
       <ErrorModal
         visible={errorModal.visible}
         message={errorModal.message}
         onClose={() => setErrorModal({ visible: false, message: '' })}
         theme={theme}
       />
-      {/* Success Modal */}
       <ErrorModal
         visible={successModal.visible}
         message={successModal.message}
@@ -723,6 +1103,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#FFF0F6',
   },
+
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -746,6 +1127,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   menuOption: { fontSize: 16, padding: 10, color: '#222' },
+
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -756,6 +1138,7 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   searchInput: { flex: 1, marginLeft: 10, color: '#333' },
+
   section: { marginBottom: 24 },
   sectionHeader: {
     flexDirection: 'row',
@@ -765,6 +1148,7 @@ const styles = StyleSheet.create({
   },
   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#222' },
   seeAll: { color: '#FF6347', fontWeight: 'bold' },
+
   fab: {
     position: 'absolute',
     right: 30,
@@ -780,6 +1164,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 4 },
+    zIndex: 10,
   },
   uploadStatus: {
     position: 'absolute',
@@ -791,38 +1176,43 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     flexDirection: 'row',
     alignItems: 'center',
+    zIndex: 10,
   },
   uploadText: { marginLeft: 10, fontSize: 16, color: 'white' },
-  modalContent: {
+
+  multiSelectBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#fff',
-    padding: 24,
-    borderRadius: 12,
-    alignItems: 'center',
+    borderRadius: 16,
+    padding: 8,
+    marginBottom: 8,
+    marginHorizontal: 4,
+    elevation: 2,
+    justifyContent: 'space-between',
   },
-  modalButton: {
-    backgroundColor: '#FF80AB',
-    padding: 12,
-    borderRadius: 8,
-    marginHorizontal: 10,
-    minWidth: 80,
-    alignItems: 'center',
-  },
+
+  // Viewer footer
   viewerFooter: {
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 60,
+    marginBottom: 24,
     width: '100%',
     position: 'absolute',
     bottom: 0,
   },
   viewerButton: {
     backgroundColor: 'rgba(0,0,0,0.6)',
-    paddingVertical: 12,
-    paddingHorizontal: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
     borderRadius: 8,
-    marginHorizontal: 10,
+    marginHorizontal: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    minWidth: 44,
   },
+
   dropdown: {
     position: 'absolute',
     top: 110,
@@ -846,7 +1236,13 @@ const styles = StyleSheet.create({
 
 export default GalleryScreen;
 
-// import React, { useState, useEffect, useCallback } from 'react';
+// import React, {
+//   useState,
+//   useEffect,
+//   useCallback,
+//   useMemo,
+//   useRef,
+// } from 'react';
 // import {
 //   View,
 //   Text,
@@ -860,9 +1256,11 @@ export default GalleryScreen;
 //   Image,
 //   Alert,
 //   Dimensions,
+//   RefreshControl,
+//   TouchableWithoutFeedback,
+//   UIManager,
+//   Linking,
 // } from 'react-native';
-// import CommentsSection from '../components/CommentsSection';
-// import { useFocusEffect } from '@react-navigation/native';
 // import { SafeAreaView } from 'react-native-safe-area-context';
 // import { useTheme } from '../theme/ThemeContext';
 // import { supabase } from '../services/supabase';
@@ -874,6 +1272,7 @@ export default GalleryScreen;
 // import BlobUtil from 'react-native-blob-util';
 // import Icon from 'react-native-vector-icons/Ionicons';
 // import Modal from 'react-native-modal';
+// import Video from 'react-native-video';
 // import { format, parseISO, isToday, isSameMonth, isSameWeek } from 'date-fns';
 // import {
 //   Menu,
@@ -881,212 +1280,339 @@ export default GalleryScreen;
 //   MenuOption,
 //   MenuTrigger,
 // } from 'react-native-popup-menu';
+// import CommentsSection from '../components/CommentsSection';
+// import { useFocusEffect } from '@react-navigation/native';
+
+// const log = (...a) => console.log('[Gallery]', ...a);
 
 // const IMAGEKIT_LIMIT_GB = 19;
 // const IMAGEKIT_PUBLIC_KEY = 'public_IAZdw7PGwJlYkHZC8/KN4/9TdRw=';
 
 // const FILTERS = [
 //   { label: 'All', value: 'all' },
+//   { label: 'Photos', value: 'photo' },
+//   { label: 'Videos', value: 'video' },
+//   { label: 'Favorites', value: 'favorites' },
 //   { label: 'This Month', value: 'month' },
 //   { label: 'This Week', value: 'week' },
 // ];
 
 // const { width } = Dimensions.get('window');
-// const gridItemSize = (width - 48) / 2;
 
 // const GalleryScreen = ({ navigation }) => {
 //   const { theme } = useTheme();
+
+//   // Data
 //   const [images, setImages] = useState([]);
+//   const [avatarUrl, setAvatarUrl] = useState('');
+//   const [userId, setUserId] = useState('');
+
+//   // UI state
 //   const [loading, setLoading] = useState(true);
+//   const [refreshing, setRefreshing] = useState(false);
 //   const [uploading, setUploading] = useState(false);
 //   const [progress, setProgress] = useState(0);
-//   const [isViewerVisible, setIsViewerVisible] = useState(false);
-//   const [currentIndex, setCurrentIndex] = useState(0);
-//   const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
-//   const [selectedImage, setSelectedImage] = useState(null);
-//   const [fetchError, setFetchError] = useState(null);
+
 //   const [search, setSearch] = useState('');
 //   const [filter, setFilter] = useState('all');
 //   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
+
+//   // Photo viewer
+//   const [isViewerVisible, setIsViewerVisible] = useState(false);
+//   const [photoViewerIndex, setPhotoViewerIndex] = useState(0); // index into photosOnly
+//   const [showFooter, setShowFooter] = useState(true); // visible by default
+
+//   // Video viewer
+//   const [videoVisible, setVideoVisible] = useState(false);
+//   const [videoUri, setVideoUri] = useState('');
+
+//   // Item actions
+//   const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
+//   const [selectedImage, setSelectedImage] = useState(null);
+
+//   // Comments
+//   const [showComments, setShowComments] = useState(false);
+
+//   // Multi-select
+//   const [multiSelect, setMultiSelect] = useState(false);
+//   const [selectedIds, setSelectedIds] = useState([]);
+
+//   // Status modals
 //   const [errorModal, setErrorModal] = useState({ visible: false, message: '' });
 //   const [successModal, setSuccessModal] = useState({
 //     visible: false,
 //     message: '',
 //   });
-//   const [avatarUrl, setAvatarUrl] = useState('');
-//   const [refreshing, setRefreshing] = useState(false);
 
-//   // Debug log for every render
-//   console.log('[GalleryScreen] Render', {
+//   // Detect native video module (prevents RCTVideo crash)
+//   const videoSupportedRef = useRef(false);
+//   useEffect(() => {
+//     try {
+//       const cfg = UIManager.getViewManagerConfig
+//         ? UIManager.getViewManagerConfig('RCTVideo')
+//         : UIManager.RCTVideo;
+//       videoSupportedRef.current = !!cfg;
+//       log('RCTVideo available:', !!cfg);
+//     } catch (e) {
+//       log('RCTVideo VM lookup error:', e);
+//       videoSupportedRef.current = false;
+//     }
+//   }, []);
+
+//   log('Render', {
 //     loading,
-//     imagesCount: images.length,
+//     count: images.length,
 //     search,
 //     filter,
+//     multiSelect,
+//     selectedIdsLen: selectedIds.length,
+//     uploading,
+//     progress,
 //   });
 
-//   // Fetch profile avatar for header
-//   useEffect(() => {
-//     const fetchProfileAvatar = async () => {
+//   // Load auth + avatar
+//   const fetchProfileAvatar = useCallback(async () => {
+//     try {
 //       const {
 //         data: { user },
+//         error,
 //       } = await supabase.auth.getUser();
+//       if (error) log('getUser error:', error);
 //       if (!user) return;
-//       let { data, error } = await supabase
+//       setUserId(user.id);
+//       const { data, error: pErr } = await supabase
 //         .from('profiles')
 //         .select('avatar_url')
 //         .eq('id', user.id)
-//         .single();
-//       if (data && data.avatar_url) setAvatarUrl(data.avatar_url);
-//       else setAvatarUrl('');
-//       console.log('[GalleryScreen] Loaded avatar:', data?.avatar_url);
-//     };
-//     fetchProfileAvatar();
+//         .maybeSingle();
+//       if (pErr) log('profile fetch error:', pErr);
+//       setAvatarUrl(data?.avatar_url || '');
+//       log('Loaded avatar:', data?.avatar_url);
+//     } catch (e) {
+//       log('fetchProfileAvatar exception:', e);
+//     }
 //   }, []);
 
-//   // Fetch images from Supabase
+//   useEffect(() => {
+//     fetchProfileAvatar();
+//   }, [fetchProfileAvatar]);
+
+//   useFocusEffect(
+//     useCallback(() => {
+//       fetchProfileAvatar();
+//     }, [fetchProfileAvatar]),
+//   );
+
+//   // Fetch images
 //   const fetchImages = useCallback(async () => {
-//     console.log('[GalleryScreen] --- Fetching images from Supabase... ---');
-//     setLoading(true);
-//     setFetchError(null);
-//     const { data, error } = await supabase
-//       .from('images')
-//       .select('*')
-//       .order('created_at', { ascending: false });
-//     if (error) {
-//       setFetchError(error.message);
-//       setErrorModal({ visible: true, message: error.message });
-//       setImages([]);
-//     } else {
+//     try {
+//       log('--- Fetching images from Supabase... ---');
+//       setLoading(true);
+//       const { data, error } = await supabase
+//         .from('images')
+//         .select('*')
+//         .order('created_at', { ascending: false });
+//       if (error) throw error;
 //       setImages(data || []);
-//       console.log(
-//         '[GalleryScreen] Supabase fetch success. Images:',
-//         data?.length,
-//         data,
-//       );
+//       log('Supabase fetch success. Images:', data?.length);
+//     } catch (e) {
+//       log('Fetch error:', e);
+//       setErrorModal({ visible: true, message: e.message || String(e) });
+//       setImages([]);
+//     } finally {
+//       setLoading(false);
+//       setRefreshing(false);
 //     }
-//     setLoading(false);
-//     setRefreshing(false);
 //   }, []);
 
 //   useEffect(() => {
 //     fetchImages();
-//     const imagesChannel = supabase
+//     const ch = supabase
 //       .channel('public:images')
 //       .on(
 //         'postgres_changes',
 //         { event: '*', schema: 'public', table: 'images' },
 //         payload => {
-//           console.log(
-//             '[GalleryScreen] --- Supabase real-time event received ---',
+//           log(
+//             'Realtime event:',
 //             payload.eventType,
+//             payload.new?.id || payload.old?.id,
 //           );
 //           fetchImages();
 //         },
 //       )
 //       .subscribe();
 //     return () => {
-//       supabase.removeChannel(imagesChannel);
+//       supabase.removeChannel(ch);
 //     };
 //   }, [fetchImages]);
 
-//   // Group images by date
-//   const groupImagesByDate = imagesArr => {
+//   // Group by date
+//   const groupImagesByDate = useCallback(arr => {
 //     const groups = {};
-//     imagesArr.forEach(img => {
+//     for (const img of arr) {
 //       const date = format(parseISO(img.created_at), 'yyyy-MM-dd');
 //       if (!groups[date]) groups[date] = [];
 //       groups[date].push(img);
-//     });
+//     }
 //     return groups;
-//   };
+//   }, []);
 
-//   // Filter images by search and filter
-//   const getFilteredImages = () => {
-//     let filtered = images;
+//   // Filters
+//   const filteredImages = useMemo(() => {
+//     let list = images;
 //     if (search) {
-//       filtered = filtered.filter(
+//       const q = search.toLowerCase();
+//       list = list.filter(
 //         img =>
-//           (img.image_url &&
-//             img.image_url.toLowerCase().includes(search.toLowerCase())) ||
-//           (img.file_name &&
-//             img.file_name.toLowerCase().includes(search.toLowerCase())),
+//           img.image_url?.toLowerCase().includes(q) ||
+//           img.file_name?.toLowerCase().includes(q),
 //       );
 //     }
-//     if (filter === 'month') {
-//       filtered = filtered.filter(img =>
+//     if (filter === 'photo') list = list.filter(img => img.type === 'photo');
+//     else if (filter === 'video')
+//       list = list.filter(img => img.type === 'video');
+//     else if (filter === 'favorites') list = list.filter(img => img.favorite);
+//     else if (filter === 'month')
+//       list = list.filter(img =>
 //         isSameMonth(parseISO(img.created_at), new Date()),
 //       );
-//     } else if (filter === 'week') {
-//       filtered = filtered.filter(img =>
+//     else if (filter === 'week')
+//       list = list.filter(img =>
 //         isSameWeek(parseISO(img.created_at), new Date(), { weekStartsOn: 1 }),
 //       );
-//     }
-//     return filtered;
-//   };
+//     return list;
+//   }, [images, search, filter]);
 
-//   // Upload handler (ImageKit until full, then Cloudinary)
+//   const photosOnly = useMemo(
+//     () => filteredImages.filter(i => i.type !== 'video'),
+//     [filteredImages],
+//   );
+
+//   const groupedImages = useMemo(
+//     () => groupImagesByDate(filteredImages),
+//     [filteredImages, groupImagesByDate],
+//   );
+
+//   // Upload handler
 //   const handleImagePickAndUpload = () => {
 //     launchImageLibrary(
-//       { mediaType: 'photo', selectionLimit: 0 },
+//       { mediaType: 'mixed', selectionLimit: 0 },
 //       async response => {
-//         if (response.didCancel) return;
-//         if (response.errorCode) {
-//           setErrorModal({ visible: true, message: response.errorMessage });
-//           return;
+//         if (response?.didCancel) return;
+//         if (response?.errorCode) {
+//           return setErrorModal({
+//             visible: true,
+//             message: response.errorMessage || 'Picker error',
+//           });
 //         }
-//         const assets = response.assets;
-//         if (!assets || assets.length === 0) return;
-//         setUploading(true);
-//         let successCount = 0;
-//         const usageRes = await fetch(
-//           'https://boyfriend-needs-backend.vercel.app/api/imagekit-usage',
-//         );
-//         const usage = await usageRes.json();
-//         const useImageKit = usage.totalGB < IMAGEKIT_LIMIT_GB;
-//         for (let i = 0; i < assets.length; i++) {
-//           const asset = assets[i];
-//           setProgress(0);
-//           try {
-//             let uploadUrl = '',
-//               storageType = '';
+//         const assets = response?.assets;
+//         if (!assets?.length) return;
+
+//         try {
+//           setUploading(true);
+//           let successCount = 0;
+
+//           const usageRes = await fetch(
+//             'https://boyfriend-needs-backend.vercel.app/api/imagekit-usage',
+//           );
+//           const usage = await usageRes.json();
+//           const useImageKit = usage?.totalGB < IMAGEKIT_LIMIT_GB;
+//           log('Upload will use:', useImageKit ? 'ImageKit' : 'Cloudinary');
+
+//           const {
+//             data: { user },
+//           } = await supabase.auth.getUser();
+//           if (!user) {
+//             setErrorModal({
+//               visible: true,
+//               message: 'You are not logged in. Please log in again.',
+//             });
+//             setUploading(false);
+//             return;
+//           }
+
+//           for (let i = 0; i < assets.length; i++) {
+//             const asset = assets[i];
+//             setProgress(0);
+//             const isVideo = asset.type?.startsWith('video');
+//             const type = isVideo ? 'video' : 'photo';
+
+//             let uploadUrl = '';
+//             let storageType = '';
+
 //             if (useImageKit) {
-//               const signatureData = await fetch(
-//                 'https://boyfriend-needs-backend.vercel.app/api/imagekit-auth',
-//               ).then(res => res.json());
-//               const uploadData = [
-//                 {
-//                   name: 'file',
-//                   filename: asset.fileName,
-//                   data: BlobUtil.wrap(asset.uri.replace('file://', '')),
-//                 },
-//                 { name: 'publicKey', data: IMAGEKIT_PUBLIC_KEY },
-//                 { name: 'signature', data: signatureData.signature },
-//                 { name: 'expire', data: String(signatureData.expire) },
-//                 { name: 'token', data: signatureData.token },
-//                 { name: 'fileName', data: asset.fileName },
-//               ];
-//               const task = BlobUtil.fetch(
-//                 'POST',
-//                 'https://upload.imagekit.io/api/v1/files/upload',
-//                 { 'Content-Type': 'multipart/form-data' },
-//                 uploadData,
-//               );
-//               task.uploadProgress((written, total) =>
-//                 setProgress(Math.round((written / total) * 100)),
-//               );
-//               const uploadResult = await task;
-//               const resultJson = uploadResult.json();
-//               if (uploadResult.info().status >= 300)
-//                 throw new Error(resultJson.message || 'ImageKit upload failed');
-//               uploadUrl = resultJson.url;
-//               storageType = 'imagekit';
-//               console.log(
-//                 '[GalleryScreen] ImageKit upload success:',
-//                 uploadUrl,
-//               );
+//               try {
+//                 const signatureData = await fetch(
+//                   'https://boyfriend-needs-backend.vercel.app/api/imagekit-auth',
+//                 ).then(res => res.json());
+//                 log('Got ImageKit signature for asset', i);
+
+//                 const fileName = asset.fileName || `media_${Date.now()}_${i}`;
+//                 const wrappedPath = BlobUtil.wrap(
+//                   (asset.uri || '').startsWith('file://')
+//                     ? asset.uri.replace('file://', '')
+//                     : asset.uri || '',
+//                 );
+//                 const uploadData = [
+//                   { name: 'file', filename: fileName, data: wrappedPath },
+//                   { name: 'publicKey', data: IMAGEKIT_PUBLIC_KEY },
+//                   { name: 'signature', data: signatureData.signature },
+//                   { name: 'expire', data: String(signatureData.expire) },
+//                   { name: 'token', data: signatureData.token },
+//                   { name: 'fileName', data: fileName },
+//                 ];
+
+//                 const task = BlobUtil.fetch(
+//                   'POST',
+//                   'https://upload.imagekit.io/api/v1/files/upload',
+//                   {},
+//                   uploadData,
+//                 );
+//                 task.uploadProgress((written, total) => {
+//                   const pct =
+//                     total > 0 ? Math.round((written / total) * 100) : 0;
+//                   setProgress(pct);
+//                 });
+
+//                 const uploadResult = await task;
+//                 const resultJson = uploadResult.json();
+//                 if (uploadResult.info().status >= 300)
+//                   throw new Error(
+//                     resultJson?.message || 'ImageKit upload failed',
+//                   );
+
+//                 uploadUrl = resultJson.url;
+//                 storageType = 'imagekit';
+//                 log('ImageKit upload success:', uploadUrl);
+//               } catch (e) {
+//                 log(
+//                   'ImageKit upload error, fallback to Cloudinary:',
+//                   e?.message || e,
+//                 );
+//                 const fileBase64 = await BlobUtil.fs.readFile(
+//                   (asset.uri || '').replace('file://', ''),
+//                   'base64',
+//                 );
+//                 const cloudRes = await fetch(
+//                   'https://boyfriend-needs-backend.vercel.app/api/cloudinary-upload',
+//                   {
+//                     method: 'POST',
+//                     headers: { 'Content-Type': 'application/json' },
+//                     body: JSON.stringify({
+//                       fileBase64: `data:${asset.type};base64,${fileBase64}`,
+//                     }),
+//                   },
+//                 );
+//                 const cloudJson = await cloudRes.json();
+//                 if (!cloudJson.url) throw new Error('Cloudinary upload failed');
+//                 uploadUrl = cloudJson.url;
+//                 storageType = 'cloudinary';
+//                 log('Cloudinary upload success:', uploadUrl);
+//               }
 //             } else {
 //               const fileBase64 = await BlobUtil.fs.readFile(
-//                 asset.uri.replace('file://', ''),
+//                 (asset.uri || '').replace('file://', ''),
 //                 'base64',
 //               );
 //               const cloudRes = await fetch(
@@ -1103,68 +1629,44 @@ export default GalleryScreen;
 //               if (!cloudJson.url) throw new Error('Cloudinary upload failed');
 //               uploadUrl = cloudJson.url;
 //               storageType = 'cloudinary';
-//               console.log(
-//                 '[GalleryScreen] Cloudinary upload success:',
-//                 uploadUrl,
-//               );
-//             }
-//             // Save to Supabase
-//             const {
-//               data: { user },
-//               error: userError,
-//             } = await supabase.auth.getUser();
-//             console.log('[GalleryScreen] Supabase user:', user, userError);
-
-//             if (!user) {
-//               setErrorModal({
-//                 visible: true,
-//                 message: 'You are not logged in. Please log in again.',
-//               });
-//               setUploading(false);
-//               return;
+//               log('Cloudinary upload success:', uploadUrl);
 //             }
 
-//             const { error: supabaseError } = await supabase
-//               .from('images')
-//               .insert({
-//                 user_id: user.id,
-//                 image_url: uploadUrl,
-//                 storage_type: storageType,
-//                 created_at: new Date().toISOString(),
-//                 file_name: asset.fileName,
-//                 favorite: false,
-//               });
+//             // Insert row
+//             const { error: sErr } = await supabase.from('images').insert({
+//               user_id: user.id,
+//               image_url: uploadUrl,
+//               storage_type: storageType,
+//               created_at: new Date().toISOString(),
+//               file_name: asset.fileName || '',
+//               favorite: false,
+//               type,
+//               private: false,
+//             });
 
-//             console.log(
-//               '[GalleryScreen] Supabase insert error:',
-//               supabaseError,
-//             );
-
-//             if (supabaseError) {
-//               setErrorModal({ visible: true, message: supabaseError.message });
+//             if (sErr) {
+//               log('Supabase insert error:', sErr);
+//               setErrorModal({ visible: true, message: sErr.message });
 //               break;
 //             }
 //             successCount++;
-//           } catch (e) {
-//             setErrorModal({ visible: true, message: e.message });
-//             break;
 //           }
+
+//           if (successCount > 0) {
+//             setSuccessModal({
+//               visible: true,
+//               message: `${successCount} file(s) uploaded!`,
+//             });
+//             fetchImages();
+//           }
+//         } catch (e) {
+//           log('Upload exception:', e);
+//           setErrorModal({ visible: true, message: e.message || String(e) });
+//         } finally {
+//           setUploading(false);
 //         }
-//         setUploading(false);
-//         if (successCount > 0) {
-//           setSuccessModal({
-//             visible: true,
-//             message: `${successCount} photo(s) uploaded!`,
-//           });
-//         }
-//         fetchImages();
 //       },
 //     );
-//   };
-
-//   const handleSignOut = async () => {
-//     await supabase.auth.signOut();
-//     navigation.replace('Auth');
 //   };
 
 //   const onRefresh = () => {
@@ -1172,91 +1674,181 @@ export default GalleryScreen;
 //     fetchImages();
 //   };
 
-//   const openImage = index => {
-//     setCurrentIndex(index);
-//     setIsViewerVisible(true);
-//   };
-
-//   const openDeleteModal = image => {
-//     setSelectedImage(image);
-//     setIsDeleteModalVisible(true);
-//     console.log('[GalleryScreen] Opened delete modal for image:', image.id);
-//   };
-
-//   const handleDelete = async () => {
-//     if (!selectedImage) return;
-//     try {
-//       const { error } = await supabase
-//         .from('images')
-//         .delete()
-//         .eq('id', selectedImage.id);
-//       if (error) {
-//         setErrorModal({ visible: true, message: error.message });
+//   // Open
+//   const openItem = item => {
+//     if (multiSelect) {
+//       toggleSelect(item.id);
+//       return;
+//     }
+//     if (item.type === 'video') {
+//       if (videoSupportedRef.current) {
+//         setVideoUri(item.image_url);
+//         setVideoVisible(true);
+//         log('Open video viewer for id:', item.id);
 //       } else {
-//         setIsDeleteModalVisible(false);
-//         setSelectedImage(null);
-//         fetchImages();
-//         console.log('[GalleryScreen] Deleted image:', selectedImage.id);
+//         log('RCTVideo not available. Opening external player.');
+//         Alert.alert(
+//           'Opening externally',
+//           'Native video module missing; opening in external player.',
+//         );
+//         Linking.openURL(item.image_url);
 //       }
+//     } else {
+//       const idx = photosOnly.findIndex(p => p.id === item.id);
+//       setPhotoViewerIndex(Math.max(0, idx));
+//       setIsViewerVisible(true);
+//       setShowFooter(true);
+//       setShowComments(false);
+//       log('Open photo viewer for id:', item.id, 'photoIndex:', idx);
+//     }
+//   };
+
+//   // Single delete (from viewer footer)
+//   const deleteCurrentPhoto = async () => {
+//     const img = photosOnly[photoViewerIndex];
+//     if (!img) return;
+//     Alert.alert('Delete', 'Delete this photo?', [
+//       { text: 'Cancel', style: 'cancel' },
+//       {
+//         text: 'Delete',
+//         style: 'destructive',
+//         onPress: async () => {
+//           const { error } = await supabase
+//             .from('images')
+//             .delete()
+//             .eq('id', img.id);
+//           if (error) {
+//             setErrorModal({ visible: true, message: error.message });
+//           } else {
+//             setIsViewerVisible(false);
+//             fetchImages();
+//             log('Deleted photo id:', img.id);
+//           }
+//         },
+//       },
+//     ]);
+//   };
+
+//   const handleShareCurrent = async () => {
+//     try {
+//       const img = photosOnly[photoViewerIndex];
+//       if (!img) return;
+//       await Share.open({ url: img.image_url });
+//       log('Shared photo:', img.image_url);
 //     } catch (e) {
+//       log('Share error:', e);
 //       setErrorModal({ visible: true, message: e.message });
 //     }
 //   };
 
-//   const handleShare = async () => {
+//   const handleSaveCurrent = async () => {
 //     try {
-//       const image = getFilteredImages()[currentIndex];
-//       if (!image) return;
-//       await Share.open({ url: image.image_url });
-//       console.log('[GalleryScreen] Shared image:', image.image_url);
-//     } catch (e) {
-//       setErrorModal({ visible: true, message: e.message });
-//     }
-//   };
-
-//   const handleSave = async () => {
-//     try {
-//       const image = getFilteredImages()[currentIndex];
-//       if (!image) return;
-//       const fileUrl = image.image_url;
+//       const img = photosOnly[photoViewerIndex];
+//       if (!img) return;
+//       const fileUrl = img.image_url;
 //       const fileName = fileUrl.split('/').pop();
 //       const dirs = BlobUtil.fs.dirs;
-//       const downloadDest =
+//       const dest =
 //         Platform.OS === 'android'
 //           ? `${dirs.DownloadDir}/${fileName}`
 //           : `${dirs.DocumentDir}/${fileName}`;
-//       await BlobUtil.config({ path: downloadDest }).fetch('GET', fileUrl);
-//       setSuccessModal({
-//         visible: true,
-//         message: 'Image saved to your device.',
-//       });
-//       console.log('[GalleryScreen] Saved image to device:', downloadDest);
+//       await BlobUtil.config({ path: dest }).fetch('GET', fileUrl);
+//       setSuccessModal({ visible: true, message: 'Saved to device.' });
+//       log('Saved file to:', dest);
+//     } catch (e) {
+//       log('Save error:', e);
+//       setErrorModal({ visible: true, message: e.message });
+//     }
+//   };
+
+//   const toggleFavoriteCurrent = async () => {
+//     const img = photosOnly[photoViewerIndex];
+//     if (!img) return;
+//     try {
+//       const updated = !img.favorite;
+//       await supabase
+//         .from('images')
+//         .update({ favorite: updated })
+//         .eq('id', img.id);
+//       setImages(prev =>
+//         prev.map(i => (i.id === img.id ? { ...i, favorite: updated } : i)),
+//       );
+//       log('Toggled favorite id:', img.id, '->', updated);
 //     } catch (e) {
 //       setErrorModal({ visible: true, message: e.message });
 //     }
 //   };
 
-//   const handleToggleFavorite = async image => {
+//   // Multi-select helpers
+//   const toggleSelect = id => {
+//     setSelectedIds(prev =>
+//       prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id],
+//     );
+//   };
+
+//   const startMultiSelect = id => {
+//     if (!multiSelect) setMultiSelect(true);
+//     toggleSelect(id);
+//     log('Multi-select start/toggle id:', id);
+//   };
+
+//   const handleBatchDelete = async () => {
+//     if (!selectedIds.length) return;
+//     Alert.alert('Delete', `Delete ${selectedIds.length} item(s)?`, [
+//       { text: 'Cancel', style: 'cancel' },
+//       {
+//         text: 'Delete',
+//         style: 'destructive',
+//         onPress: async () => {
+//           await supabase.from('images').delete().in('id', selectedIds);
+//           setSelectedIds([]);
+//           setMultiSelect(false);
+//           fetchImages();
+//           log('Batch deleted count:', selectedIds.length);
+//         },
+//       },
+//     ]);
+//   };
+
+//   const handleBatchShare = async () => {
+//     if (!selectedIds.length) return;
+//     const urls = images
+//       .filter(i => selectedIds.includes(i.id))
+//       .map(i => i.image_url);
 //     try {
-//       const updated = !image.favorite;
+//       await Share.open({ urls });
+//       log('Batch share urls:', urls.length);
+//     } catch (e) {
+//       log('Batch share error/cancel:', e?.message || e);
+//     }
+//   };
+
+//   const handleBatchFavoriteToggle = async () => {
+//     if (!selectedIds.length) return;
+//     try {
+//       // If any is not favorite, set all to true; else set all to false
+//       const selectedItems = images.filter(i => selectedIds.includes(i.id));
+//       const makeFav = selectedItems.some(i => !i.favorite);
 //       await supabase
 //         .from('images')
-//         .update({ favorite: updated })
-//         .eq('id', image.id);
+//         .update({ favorite: makeFav })
+//         .in('id', selectedIds);
 //       setImages(prev =>
-//         prev.map(img =>
-//           img.id === image.id ? { ...img, favorite: updated } : img,
+//         prev.map(i =>
+//           selectedIds.includes(i.id) ? { ...i, favorite: makeFav } : i,
 //         ),
 //       );
-//       console.log(
-//         '[GalleryScreen] Toggled favorite for image:',
-//         image.id,
-//         'Now:',
-//         updated,
-//       );
+//       log('Batch favorite ->', makeFav, 'count:', selectedIds.length);
 //     } catch (e) {
 //       setErrorModal({ visible: true, message: e.message });
 //     }
+//   };
+
+//   const handleSelectAll = () => {
+//     const ids = filteredImages.map(i => i.id);
+//     setSelectedIds(ids);
+//     setMultiSelect(true);
+//     log('Selected all:', ids.length);
 //   };
 
 //   // Render each date section
@@ -1280,30 +1872,20 @@ export default GalleryScreen;
 //         data={imagesArr}
 //         numColumns={2}
 //         keyExtractor={item => item.id.toString()}
-//         renderItem={({ item, index }) => (
+//         scrollEnabled={false}
+//         renderItem={({ item }) => (
 //           <PhotoGridItem
 //             image={item}
-//             onPress={() => {
-//               const idx = getFilteredImages().findIndex(
-//                 img => img.id === item.id,
-//               );
-//               setCurrentIndex(idx);
-//               setIsViewerVisible(true);
-//               console.log(
-//                 '[GalleryScreen] Opened viewer for image:',
-//                 item.id,
-//                 'at index',
-//                 idx,
-//               );
-//             }}
+//             onPress={() => openItem(item)}
+//             onLongPress={() => startMultiSelect(item.id)} // <-- requires small patch below in PhotoGridItem
+//             selected={selectedIds.includes(item.id)}
+//             showSelect={multiSelect}
 //           />
 //         )}
-//         scrollEnabled={false}
 //       />
 //     </View>
 //   );
 
-//   // UI rendering
 //   if (loading) {
 //     return (
 //       <SafeAreaView style={styles.loader}>
@@ -1315,23 +1897,6 @@ export default GalleryScreen;
 //     );
 //   }
 
-//   if (fetchError) {
-//     return (
-//       <SafeAreaView style={styles.loader}>
-//         <Text style={{ color: 'red', marginBottom: 10 }}>
-//           Error: {fetchError}
-//         </Text>
-//         <TouchableOpacity onPress={fetchImages} style={styles.fab}>
-//           <Text style={styles.fabIcon}>⟳</Text>
-//         </TouchableOpacity>
-//       </SafeAreaView>
-//     );
-//   }
-
-//   // Group and filter images
-//   const filteredImages = getFilteredImages();
-//   const groupedImages = groupImagesByDate(filteredImages);
-
 //   return (
 //     <SafeAreaView
 //       style={[
@@ -1339,7 +1904,7 @@ export default GalleryScreen;
 //         { backgroundColor: theme.colors.primary + '20' },
 //       ]}
 //     >
-//       {/* Header with Profile Avatar and Dropdown Menu */}
+//       {/* Header */}
 //       <View style={styles.header}>
 //         <TouchableOpacity onPress={() => navigation.navigate('Profile')}>
 //           <Image
@@ -1361,39 +1926,24 @@ export default GalleryScreen;
 //             />
 //           </MenuTrigger>
 //           <MenuOptions>
-//             <MenuOption
-//               onSelect={() => {
-//                 navigation.navigate('SharedCalendar');
-//                 console.log('[GalleryScreen] Menu: Shared Calendar');
-//               }}
-//             >
+//             <MenuOption onSelect={() => navigation.navigate('SharedCalendar')}>
 //               <Text style={styles.menuOption}>Shared Calendar</Text>
 //             </MenuOption>
-//             <MenuOption
-//               onSelect={() => {
-//                 navigation.navigate('ThemesStickers');
-//                 console.log('[GalleryScreen] Menu: Themes & Stickers');
-//               }}
-//             >
-//               <Text style={styles.menuOption}>Themes & Stickers</Text>
-//             </MenuOption>
-//             <MenuOption
-//               onSelect={() => {
-//                 navigation.navigate('PrivateChat');
-//                 console.log('[GalleryScreen] Menu: Private Chat');
-//               }}
-//             >
+//             <MenuOption onSelect={() => navigation.navigate('PrivateChat')}>
 //               <Text style={styles.menuOption}>Private Chat</Text>
 //             </MenuOption>
-//             <MenuOption
-//               onSelect={() => {
-//                 navigation.navigate('PhotoVault');
-//                 console.log('[GalleryScreen] Menu: Photo Vault');
-//               }}
-//             >
+//             <MenuOption onSelect={() => navigation.navigate('PhotoVault')}>
 //               <Text style={styles.menuOption}>Photo Vault</Text>
 //             </MenuOption>
-//             <MenuOption onSelect={handleSignOut}>
+//             <MenuOption
+//               onSelect={async () => {
+//                 await supabase.auth.signOut();
+//                 navigation.reset({
+//                   index: 0,
+//                   routes: [{ name: 'ProfileSelector' }],
+//                 });
+//               }}
+//             >
 //               <Text style={[styles.menuOption, { color: '#FF6347' }]}>
 //                 Sign Out
 //               </Text>
@@ -1401,7 +1951,60 @@ export default GalleryScreen;
 //           </MenuOptions>
 //         </Menu>
 //       </View>
-//       {/* Search Bar with Filter */}
+
+//       {/* Multi-select bar */}
+//       {multiSelect && (
+//         <View style={styles.multiSelectBar}>
+//           <Text style={{ color: theme.colors.primary, fontWeight: 'bold' }}>
+//             {selectedIds.length} selected
+//           </Text>
+//           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+//             <TouchableOpacity
+//               onPress={handleBatchShare}
+//               style={{ marginHorizontal: 8 }}
+//             >
+//               <Icon
+//                 name="share-social-outline"
+//                 size={22}
+//                 color={theme.colors.primary}
+//               />
+//             </TouchableOpacity>
+//             <TouchableOpacity
+//               onPress={handleBatchFavoriteToggle}
+//               style={{ marginHorizontal: 8 }}
+//             >
+//               <Icon name="heart" size={22} color="#FF80AB" />
+//             </TouchableOpacity>
+//             <TouchableOpacity
+//               onPress={handleBatchDelete}
+//               style={{ marginHorizontal: 8 }}
+//             >
+//               <Icon name="trash" size={22} color="#FF6347" />
+//             </TouchableOpacity>
+//             <TouchableOpacity
+//               onPress={handleSelectAll}
+//               style={{ marginHorizontal: 8 }}
+//             >
+//               <Icon
+//                 name="checkmark-done"
+//                 size={22}
+//                 color={theme.colors.primary}
+//               />
+//             </TouchableOpacity>
+//             <TouchableOpacity
+//               onPress={() => {
+//                 setMultiSelect(false);
+//                 setSelectedIds([]);
+//               }}
+//               style={{ marginHorizontal: 8 }}
+//             >
+//               <Icon name="close" size={22} color="#888" />
+//             </TouchableOpacity>
+//           </View>
+//         </View>
+//       )}
+
+//       {/* Search + Filter + toggle */}
 //       <View style={styles.searchBar}>
 //         <Icon name="search" size={20} color="#aaa" />
 //         <TextInput
@@ -1409,17 +2012,26 @@ export default GalleryScreen;
 //           placeholder="Search by file or date"
 //           placeholderTextColor="#aaa"
 //           value={search}
-//           onChangeText={text => {
-//             setSearch(text);
-//             console.log('[GalleryScreen] Search changed:', text);
+//           onChangeText={t => {
+//             setSearch(t);
+//             log('Search changed:', t);
 //           }}
 //         />
-//         <TouchableOpacity
-//           onPress={() => setShowFilterDropdown(!showFilterDropdown)}
-//         >
+//         <TouchableOpacity onPress={() => setShowFilterDropdown(v => !v)}>
 //           <Icon name="filter" size={22} color={theme.colors.primary} />
 //         </TouchableOpacity>
+//         <TouchableOpacity
+//           onPress={() => setMultiSelect(v => !v)}
+//           style={{ marginLeft: 8 }}
+//         >
+//           <Icon
+//             name={multiSelect ? 'checkbox' : 'checkbox-outline'}
+//             size={22}
+//             color={theme.colors.primary}
+//           />
+//         </TouchableOpacity>
 //       </View>
+
 //       {/* Filter Dropdown */}
 //       {showFilterDropdown && (
 //         <View style={styles.dropdown}>
@@ -1435,7 +2047,7 @@ export default GalleryScreen;
 //               onPress={() => {
 //                 setFilter(f.value);
 //                 setShowFilterDropdown(false);
-//                 console.log('[GalleryScreen] Filter set to:', f.value);
+//                 log('Filter set to:', f.value);
 //               }}
 //             >
 //               <Text
@@ -1450,16 +2062,24 @@ export default GalleryScreen;
 //           ))}
 //         </View>
 //       )}
-//       {/* Date sections */}
-//       <ScrollView contentContainerStyle={{ paddingBottom: 120 }}>
+
+//       {/* Sections */}
+//       <ScrollView
+//         contentContainerStyle={{ paddingBottom: 120 }}
+//         refreshControl={
+//           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+//         }
+//       >
 //         {Object.keys(groupedImages).map(date =>
 //           renderSection(date, groupedImages[date]),
 //         )}
 //       </ScrollView>
+
 //       {/* Upload FAB */}
 //       <TouchableOpacity style={styles.fab} onPress={handleImagePickAndUpload}>
 //         <Icon name="add" size={30} color="#fff" />
 //       </TouchableOpacity>
+
 //       {/* Upload Progress */}
 //       {uploading && (
 //         <View style={styles.uploadStatus}>
@@ -1467,82 +2087,120 @@ export default GalleryScreen;
 //           <Text style={styles.uploadText}>Uploading... {progress}%</Text>
 //         </View>
 //       )}
-//       {/* Image Viewer */}
+
+//       {/* Photo Viewer */}
 //       <ImageViewing
-//         images={filteredImages.map(img => ({ uri: img.image_url }))}
-//         imageIndex={currentIndex}
+//         images={photosOnly.map(img => ({ uri: img.image_url }))}
+//         imageIndex={photoViewerIndex}
 //         visible={isViewerVisible}
 //         onRequestClose={() => setIsViewerVisible(false)}
+//         doubleTapToZoomEnabled
+//         swipeToCloseEnabled
+//         onImageIndexChange={() => {
+//           setShowFooter(true);
+//           setShowComments(false);
+//         }}
+//         imageContainerStyle={{ marginBottom: showFooter ? 180 : 0 }}
 //         FooterComponent={() => {
-//           const image = filteredImages[currentIndex];
-//           if (!image) return null;
+//           const img = photosOnly[photoViewerIndex];
+//           if (!img) return null;
 //           return (
-//             <View style={styles.viewerFooter}>
-//               <TouchableOpacity
-//                 style={styles.viewerButton}
-//                 onPress={handleShare}
-//               >
-//                 <Icon name="share-social-outline" size={22} color="#fff" />
-//               </TouchableOpacity>
-//               <TouchableOpacity
-//                 style={styles.viewerButton}
-//                 onPress={handleSave}
-//               >
-//                 <Icon name="download-outline" size={22} color="#fff" />
-//               </TouchableOpacity>
-//               <TouchableOpacity
-//                 style={styles.viewerButton}
-//                 onPress={() => handleToggleFavorite(image)}
-//               >
-//                 <Icon
-//                   name={image.favorite ? 'heart' : 'heart-outline'}
-//                   size={22}
-//                   color="#FF80AB"
+//             <View>
+//               <View style={styles.viewerFooter}>
+//                 <TouchableOpacity
+//                   style={styles.viewerButton}
+//                   onPress={handleShareCurrent}
+//                 >
+//                   <Icon name="share-social-outline" size={22} color="#fff" />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   style={styles.viewerButton}
+//                   onPress={handleSaveCurrent}
+//                 >
+//                   <Icon name="download-outline" size={22} color="#fff" />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   style={styles.viewerButton}
+//                   onPress={toggleFavoriteCurrent}
+//                 >
+//                   <Icon
+//                     name={img.favorite ? 'heart' : 'heart-outline'}
+//                     size={22}
+//                     color="#FF80AB"
+//                   />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   style={styles.viewerButton}
+//                   onPress={deleteCurrentPhoto}
+//                 >
+//                   <Icon name="trash-outline" size={22} color="#FF6347" />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   style={styles.viewerButton}
+//                   onPress={() => setShowComments(v => !v)}
+//                 >
+//                   <Icon
+//                     name="chatbubble-ellipses-outline"
+//                     size={22}
+//                     color="#fff"
+//                   />
+//                 </TouchableOpacity>
+//               </View>
+//               {showComments && (
+//                 <CommentsSection
+//                   imageId={img.id}
+//                   userId={userId}
+//                   theme={theme}
 //                 />
-//               </TouchableOpacity>
-//               <TouchableOpacity
-//                 style={styles.viewerButton}
-//                 onPress={() => openDeleteModal(image)}
-//               >
-//                 <Icon name="trash-outline" size={22} color="#FF6347" />
-//               </TouchableOpacity>
+//               )}
 //             </View>
 //           );
 //         }}
 //       />
-//       {/* Delete Modal */}
-//       <Modal isVisible={isDeleteModalVisible}>
-//         <View style={styles.modalContent}>
-//           <Text
+
+//       {/* Video Viewer (dedicated) */}
+//       <Modal
+//         isVisible={videoVisible}
+//         onBackdropPress={() => setVideoVisible(false)}
+//         onBackButtonPress={() => setVideoVisible(false)}
+//         style={{ margin: 0 }}
+//         useNativeDriver
+//         hideModalContentWhileAnimating
+//       >
+//         <View style={{ flex: 1, backgroundColor: '#000' }}>
+//           <Video
+//             source={{ uri: videoUri }}
+//             style={{ width: '100%', height: '100%' }}
+//             controls
+//             paused={false}
+//             resizeMode="contain"
+//             onError={e => log('Video error:', e)}
+//             onLoad={meta => log('Video loaded duration:', meta.duration)}
+//             posterResizeMode="cover"
+//           />
+//           <TouchableOpacity
+//             onPress={() => setVideoVisible(false)}
 //             style={{
-//               color: theme.colors.primary,
-//               fontSize: 18,
-//               marginBottom: 20,
+//               position: 'absolute',
+//               top: 20,
+//               right: 20,
+//               backgroundColor: 'rgba(0,0,0,0.5)',
+//               padding: 8,
+//               borderRadius: 18,
 //             }}
 //           >
-//             Are you sure you want to delete this photo?
-//           </Text>
-//           <View style={{ flexDirection: 'row' }}>
-//             <TouchableOpacity style={styles.modalButton} onPress={handleDelete}>
-//               <Text style={{ color: '#fff' }}>Delete</Text>
-//             </TouchableOpacity>
-//             <TouchableOpacity
-//               style={styles.modalButton}
-//               onPress={() => setIsDeleteModalVisible(false)}
-//             >
-//               <Text style={{ color: '#fff' }}>Cancel</Text>
-//             </TouchableOpacity>
-//           </View>
+//             <Icon name="close" size={22} color="#fff" />
+//           </TouchableOpacity>
 //         </View>
 //       </Modal>
-//       {/* Error Modal */}
+
+//       {/* Error & Success */}
 //       <ErrorModal
 //         visible={errorModal.visible}
 //         message={errorModal.message}
 //         onClose={() => setErrorModal({ visible: false, message: '' })}
 //         theme={theme}
 //       />
-//       {/* Success Modal */}
 //       <ErrorModal
 //         visible={successModal.visible}
 //         message={successModal.message}
@@ -1561,6 +2219,7 @@ export default GalleryScreen;
 //     alignItems: 'center',
 //     backgroundColor: '#FFF0F6',
 //   },
+
 //   header: {
 //     flexDirection: 'row',
 //     alignItems: 'center',
@@ -1584,6 +2243,7 @@ export default GalleryScreen;
 //     flex: 1,
 //   },
 //   menuOption: { fontSize: 16, padding: 10, color: '#222' },
+
 //   searchBar: {
 //     flexDirection: 'row',
 //     alignItems: 'center',
@@ -1594,6 +2254,7 @@ export default GalleryScreen;
 //     elevation: 2,
 //   },
 //   searchInput: { flex: 1, marginLeft: 10, color: '#333' },
+
 //   section: { marginBottom: 24 },
 //   sectionHeader: {
 //     flexDirection: 'row',
@@ -1603,6 +2264,7 @@ export default GalleryScreen;
 //   },
 //   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#222' },
 //   seeAll: { color: '#FF6347', fontWeight: 'bold' },
+
 //   fab: {
 //     position: 'absolute',
 //     right: 30,
@@ -1618,6 +2280,7 @@ export default GalleryScreen;
 //     shadowOpacity: 0.2,
 //     shadowRadius: 8,
 //     shadowOffset: { width: 0, height: 4 },
+//     zIndex: 10,
 //   },
 //   uploadStatus: {
 //     position: 'absolute',
@@ -1629,38 +2292,43 @@ export default GalleryScreen;
 //     borderRadius: 20,
 //     flexDirection: 'row',
 //     alignItems: 'center',
+//     zIndex: 10,
 //   },
 //   uploadText: { marginLeft: 10, fontSize: 16, color: 'white' },
-//   modalContent: {
+
+//   multiSelectBar: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
 //     backgroundColor: '#fff',
-//     padding: 24,
-//     borderRadius: 12,
-//     alignItems: 'center',
+//     borderRadius: 16,
+//     padding: 8,
+//     marginBottom: 8,
+//     marginHorizontal: 4,
+//     elevation: 2,
+//     justifyContent: 'space-between',
 //   },
-//   modalButton: {
-//     backgroundColor: '#FF80AB',
-//     padding: 12,
-//     borderRadius: 8,
-//     marginHorizontal: 10,
-//     minWidth: 80,
-//     alignItems: 'center',
-//   },
+
+//   // Viewer footer
 //   viewerFooter: {
 //     flexDirection: 'row',
 //     justifyContent: 'center',
 //     alignItems: 'center',
-//     marginBottom: 40,
+//     marginBottom: 24,
 //     width: '100%',
 //     position: 'absolute',
 //     bottom: 0,
 //   },
 //   viewerButton: {
 //     backgroundColor: 'rgba(0,0,0,0.6)',
-//     paddingVertical: 12,
-//     paddingHorizontal: 20,
+//     paddingVertical: 10,
+//     paddingHorizontal: 10,
 //     borderRadius: 8,
-//     marginHorizontal: 10,
+//     marginHorizontal: 2,
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     minWidth: 44,
 //   },
+
 //   dropdown: {
 //     position: 'absolute',
 //     top: 110,

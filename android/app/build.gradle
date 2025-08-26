@@ -116,5 +116,7 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+    implementation "com.google.mlkit:face-detection:16.1.5"
 }
 apply from: "../../node_modules/react-native-vector-icons/fonts.gradle"
+apply plugin: 'com.google.gms.google-services'

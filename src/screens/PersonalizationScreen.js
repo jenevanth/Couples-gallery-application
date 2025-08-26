@@ -3,7 +3,9 @@ import { View, Text, StyleSheet } from 'react-native';
 
 const PersonalizationScreen = () => (
   <View style={styles.container}>
-    <Text style={styles.title}>PersonalizationScreen</Text>
+    <Text style={styles.title}>
+      Idunna next update alli madtini Bhoo, I am sorry Kano.
+    </Text>
   </View>
 );
 

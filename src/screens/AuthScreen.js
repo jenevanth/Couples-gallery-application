@@ -1,3 +1,4 @@
+// screens/AuthScreen.js
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -7,11 +8,21 @@ import {
   Alert,
   TouchableOpacity,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../theme/ThemeContext';
 import { supabase } from '../services/supabase';
 import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import ThemedButton from '../components/ThemedButton';
 import { Svg, Path } from 'react-native-svg';
+
+const log = (...a) => console.log('[Auth]', ...a);
+
+// Option 1: in-app signup disabled
+const ENABLE_IN_APP_SIGNUP = false;
+
+// Optional deep link for password reset (configure Android intent-filter if you want in-app reset)
+const APP_SCHEME = 'boyfriendneeds';
+const RESET_LINK = `${APP_SCHEME}://reset`;
 
 const GoogleIcon = () => (
   <Svg height="24" width="24" viewBox="0 0 48 48">
@@ -35,126 +46,163 @@ const GoogleIcon = () => (
 );
 
 const AuthScreen = ({ navigation }) => {
-  const { theme } = useTheme();
+  const { theme, setCurrentTheme } = useTheme(); // IMPORTANT: using setCurrentTheme
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
 
+  // Apply pending profile theme on mount so Auth is pink/blue immediately
+  useEffect(() => {
+    (async () => {
+      try {
+        const pending = await AsyncStorage.getItem('pending_profile');
+        log('pending_profile from storage:', pending);
+        if (pending) {
+          const chosen = pending === 'her' ? 'pink' : 'blue';
+          log(
+            'Calling setCurrentTheme with:',
+            chosen,
+            'typeof:',
+            typeof setCurrentTheme,
+          );
+          if (typeof setCurrentTheme === 'function') {
+            await setCurrentTheme(chosen);
+            log('Applied theme on Auth:', chosen);
+          } else {
+            log('WARN setCurrentTheme not a function');
+          }
+        } else {
+          log('No pending_profile saved');
+        }
+      } catch (e) {
+        log('pending_profile read error:', e);
+      }
+    })();
+  }, [setCurrentTheme]);
+
+  // Session listeners (Gate also routes—but keep this for responsiveness)
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session) {
-        console.log(
-          '[AuthScreen] Found active session, navigating to MainTabs.',
-        );
-        navigation.replace('MainTabs');
-      }
+      log('Initial session exists:', !!session);
+      if (session) navigation.replace('MainTabs');
     });
-
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      console.log(
-        `[AuthScreen] Auth state changed. Session exists: ${!!session}`,
-      );
-      if (session) {
-        navigation.replace('MainTabs');
-      }
+      log('Auth state changed. Session exists:', !!session);
+      if (session) navigation.replace('MainTabs');
     });
-
     return () => subscription.unsubscribe();
-  }, []);
-
-  const handleSignUp = async () => {
-    if (!email || !password) return;
-    setLoading(true);
-    console.log(`[AuthScreen] Attempting to sign up with email: ${email}`);
-    const { error } = await supabase.auth.signUp({ email, password });
-    if (error) {
-      console.error('[AuthScreen] Sign Up Error:', error.message);
-      Alert.alert('Sign Up Error', error.message);
-    } else {
-      console.log('[AuthScreen] Sign Up successful. Confirmation email sent.');
-      Alert.alert(
-        'Success!',
-        'Please check your email for a confirmation link.',
-      );
-    }
-    setLoading(false);
-  };
+  }, [navigation]);
 
   const handleSignIn = async () => {
     if (!email || !password) return;
     setLoading(true);
-    console.log(`[AuthScreen] Attempting to sign in with email: ${email}`);
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-    if (error) {
-      console.error('[AuthScreen] Sign In Error:', error.message);
-      Alert.alert('Sign In Error', error.message);
-    } else {
-      console.log('[AuthScreen] Sign In successful.');
-      navigation.replace('MainTabs');
+    try {
+      log('Attempting sign in:', email);
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error) {
+        log('Sign In error:', error);
+        Alert.alert('Sign In Error', error.message);
+      } else {
+        log('Sign In successful');
+      }
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
+  };
+
+  const handleSignUp = async () => {
+    Alert.alert(
+      'Signup disabled',
+      'Ask admin to create your account in Supabase.',
+    );
+    log('SignUp blocked (Option 1).');
+  };
+
+  const handleForgotPassword = async () => {
+    if (!email) return Alert.alert('Enter email', 'Please type your email.');
+    setLoading(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: RESET_LINK, // optional deep link (configure if you want in-app reset)
+      });
+      if (error) {
+        log('Reset error:', error);
+        Alert.alert('Reset error', error.message);
+        return;
+      }
+      Alert.alert('Check your email', 'Open the link to set a new password.');
+      log('Reset email sent.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const onGoogleButtonPress = async () => {
     try {
       setLoading(true);
-      console.log('[AuthScreen] Starting Google Sign-In process...');
+      log('Starting Google Sign-In');
       await GoogleSignin.hasPlayServices();
       const { idToken } = await GoogleSignin.signIn();
-      if (idToken) {
-        console.log(
-          '[AuthScreen] Received ID token from Google. Signing in with Supabase...',
-        );
-        const { data, error } = await supabase.auth.signInWithIdToken({
-          provider: 'google',
-          token: idToken,
-        });
-        if (error) throw error;
-        console.log('[AuthScreen] Supabase Google Sign-In successful.');
-        navigation.replace('MainTabs');
-      } else {
-        throw new Error('No ID token received from Google.');
-      }
-    } catch (error) {
-      console.error('[AuthScreen] Google Sign-In Error:', error.message);
-      Alert.alert('Google Sign-In Error', error.message);
+      if (!idToken) throw new Error('No Google ID token');
+      const { error } = await supabase.auth.signInWithIdToken({
+        provider: 'google',
+        token: idToken,
+      });
+      if (error) throw error;
+      log('Google Sign-In OK');
+    } catch (e) {
+      log('Google Sign-In error:', e);
+      Alert.alert('Google Sign-In Error', e.message);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: '#121212' }]}>
       <Text style={[styles.title, { color: theme.colors.primary }]}>
         boyfriend_needs
       </Text>
+
       <TextInput
-        style={[styles.input, { borderColor: theme.gray }]}
+        style={[styles.input, { borderColor: '#A9A9A9', color: '#fff' }]}
         placeholder="Email"
-        placeholderTextColor={theme.gray}
+        placeholderTextColor="#A9A9A9"
         value={email}
         onChangeText={setEmail}
         keyboardType="email-address"
         autoCapitalize="none"
       />
       <TextInput
-        style={[styles.input, { borderColor: theme.gray }]}
+        style={[styles.input, { borderColor: '#A9A9A9', color: '#fff' }]}
         placeholder="Password"
-        placeholderTextColor={theme.gray}
+        placeholderTextColor="#A9A9A9"
         value={password}
         onChangeText={setPassword}
         secureTextEntry
       />
+
       <ThemedButton title="Sign In" onPress={handleSignIn} disabled={loading} />
       <ThemedButton title="Sign Up" onPress={handleSignUp} disabled={loading} />
-      <Text style={styles.orText}>OR</Text>
+
       <TouchableOpacity
-        style={styles.googleButton}
+        onPress={handleForgotPassword}
+        style={{ marginTop: 12 }}
+      >
+        <Text style={{ color: theme.colors.primary, fontWeight: 'bold' }}>
+          Forgot password?
+        </Text>
+      </TouchableOpacity>
+
+      <Text style={styles.orText}>OR</Text>
+
+      <TouchableOpacity
+        style={[styles.googleButton, { borderColor: '#4285F4' }]}
         onPress={onGoogleButtonPress}
         disabled={loading}
       >
@@ -171,7 +219,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
-    backgroundColor: '#121212',
   },
   title: { fontSize: 32, fontWeight: 'bold', marginBottom: 40 },
   input: {
@@ -181,8 +228,8 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingHorizontal: 15,
     fontSize: 16,
-    color: 'white',
     marginBottom: 15,
+    backgroundColor: '#121212',
   },
   orText: { marginVertical: 20, fontSize: 16, color: '#A9A9A9' },
   googleButton: {
@@ -190,14 +237,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#121212',
     borderWidth: 1,
-    borderColor: '#4285F4',
     paddingVertical: 12,
     paddingHorizontal: 30,
     borderRadius: 8,
   },
   googleButtonText: {
     color: 'white',
-    marginLeft: 15,
+    marginLeft: 12,
     fontSize: 16,
     fontWeight: 'bold',
   },
