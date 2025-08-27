@@ -3,6 +3,7 @@ import React, { createContext, useState, useContext, useEffect } from 'react';
 import { ActivityIndicator, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { COLORS } from './colors';
+import LinearGradient from 'react-native-linear-gradient';
 
 const log = (...a) => console.log('[ThemeContext]', ...a);
 
@@ -42,17 +43,24 @@ export const ThemeProvider = ({ children }) => {
   const theme = {
     name: themeName,
     colors: themeName === 'pink' ? COLORS.pink : COLORS.blue,
+    gradient:
+      themeName === 'pink' ? COLORS.pink.gradient : COLORS.blue.gradient,
     background: COLORS.black,
     text: COLORS.white,
     gray: COLORS.gray,
+    shared: COLORS.shared,
+    glassmorphism: COLORS.glassmorphism,
   };
 
   if (loading) {
     log('Loading indicator until theme is read from storage...');
     return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-        <ActivityIndicator size="large" />
-      </View>
+      <LinearGradient
+        colors={['#667EEA', '#764BA2']}
+        style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}
+      >
+        <ActivityIndicator size="large" color="#FFFFFF" />
+      </LinearGradient>
     );
   }
 
@@ -66,30 +74,30 @@ export const ThemeProvider = ({ children }) => {
 
 export const useTheme = () => useContext(ThemeContext);
 
+// // theme/ThemeContext.js
 // import React, { createContext, useState, useContext, useEffect } from 'react';
 // import { ActivityIndicator, View } from 'react-native';
 // import AsyncStorage from '@react-native-async-storage/async-storage';
 // import { COLORS } from './colors';
 
-// // Provide a default value for the context
+// const log = (...a) => console.log('[ThemeContext]', ...a);
+
 // const ThemeContext = createContext(null);
 
 // export const ThemeProvider = ({ children }) => {
-//   const [themeName, setThemeName] = useState('blue'); // Default theme
-//   const [loading, setLoading] = useState(true); // Add a loading state
+//   const [themeName, setThemeName] = useState('blue'); // 'blue' | 'pink'
+//   const [loading, setLoading] = useState(true);
 
-//   // On app start, load the saved theme from storage
 //   useEffect(() => {
 //     const loadTheme = async () => {
+//       log('Loading appTheme from storage...');
 //       try {
 //         const savedTheme = await AsyncStorage.getItem('appTheme');
-//         if (savedTheme !== null) {
-//           setThemeName(savedTheme);
-//         }
+//         log('appTheme from storage:', savedTheme);
+//         if (savedTheme) setThemeName(savedTheme);
 //       } catch (error) {
-//         console.error('Failed to load theme.', error);
+//         console.error('[ThemeContext] Failed to load theme.', error);
 //       } finally {
-//         // Once loading is finished, set loading to false
 //         setLoading(false);
 //       }
 //     };
@@ -98,10 +106,12 @@ export const useTheme = () => useContext(ThemeContext);
 
 //   const setCurrentTheme = async name => {
 //     try {
+//       log('setCurrentTheme called with:', name);
 //       await AsyncStorage.setItem('appTheme', name);
 //       setThemeName(name);
+//       log('Theme saved to storage and state updated:', name);
 //     } catch (error) {
-//       console.error('Failed to save theme.', error);
+//       console.error('[ThemeContext] Failed to save theme.', error);
 //     }
 //   };
 
@@ -113,8 +123,8 @@ export const useTheme = () => useContext(ThemeContext);
 //     gray: COLORS.gray,
 //   };
 
-//   // While the theme is loading from storage, show a loading indicator
 //   if (loading) {
+//     log('Loading indicator until theme is read from storage...');
 //     return (
 //       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
 //         <ActivityIndicator size="large" />
@@ -122,7 +132,7 @@ export const useTheme = () => useContext(ThemeContext);
 //     );
 //   }
 
-//   // Once loaded, provide the theme to the rest of the app
+//   log('Providing theme:', themeName);
 //   return (
 //     <ThemeContext.Provider value={{ theme, setCurrentTheme }}>
 //       {children}
@@ -130,5 +140,4 @@ export const useTheme = () => useContext(ThemeContext);
 //   );
 // };
 
-// // Custom hook remains the same
 // export const useTheme = () => useContext(ThemeContext);
