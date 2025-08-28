@@ -1,15 +1,4 @@
-// GalleryScreen.js
-// Note: Full file in one block, with extensive logs and a couple of debug helpers.
-// - Invokes push-new-image-v1 after each insert (with debug_notify_self: true while you test).
-// - Adds "Test Push (notify me)" and "Log my device tokens" debug options in the header menu.
-// - Keeps the rest of your behavior, styles at the bottom are the same as you shared.
-// - No references to 'active' column (your devices table doesn't have it).
-// - If you still don't see notifications:
-// 1) Make sure Android 13+ POST_NOTIFICATIONS permission is granted.
-// 2) Ensure App.js registers your FCM token to public.devices.
-// 3) Deploy the edge function with secrets set (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, FCM_SERVER_KEY).
-// 4) Watch Supabase → Logs & Analytics → Edge Functions during a test push/upload.
-
+// GalleryScreen.js - Complete with all fixes
 import React, {
   useState,
   useEffect,
@@ -34,6 +23,9 @@ import {
   UIManager,
   Linking,
   Animated,
+  PermissionsAndroid,
+  ToastAndroid,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
@@ -54,10 +46,8 @@ import {
   MenuOption,
   MenuTrigger,
 } from 'react-native-popup-menu';
-import CommentsSection from '../components/CommentsSection';
 import { useFocusEffect } from '@react-navigation/native';
 import LinearGradient from 'react-native-linear-gradient';
-import { BlurView } from '@react-native-community/blur';
 
 const log = (...a) => console.log('[Gallery]', ...a);
 
@@ -75,17 +65,30 @@ const FILTERS = [
   { label: 'This Week', value: 'week', icon: 'today', color: '#00D4FF' },
 ];
 
-const { width } = Dimensions.get('window');
+// Instagram-style reactions
+const REACTIONS = ['❤️', '😍', '🔥', '💕', '✨', '😊'];
+
+// Slideshow durations
+const SLIDESHOW_DURATIONS = [
+  { label: '3 sec', value: 3000 },
+  { label: '5 sec', value: 5000 },
+  { label: '10 sec', value: 10000 },
+  { label: '15 sec', value: 15000 },
+];
+
+const { width, height } = Dimensions.get('window');
 
 const GalleryScreen = ({ navigation }) => {
   const { theme } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.9)).current;
+  const reactionAnim = useRef(new Animated.Value(0)).current;
 
   // Data
   const [images, setImages] = useState([]);
   const [avatarUrl, setAvatarUrl] = useState('');
   const [userId, setUserId] = useState('');
+  const [userName, setUserName] = useState('');
 
   // UI state
   const [loading, setLoading] = useState(true);
@@ -100,19 +103,20 @@ const GalleryScreen = ({ navigation }) => {
 
   // Photo viewer
   const [isViewerVisible, setIsViewerVisible] = useState(false);
-  const [photoViewerIndex, setPhotoViewerIndex] = useState(0); // index into photosOnly
-  const [showFooter, setShowFooter] = useState(true); // visible by default
+  const [photoViewerIndex, setPhotoViewerIndex] = useState(0);
+  const [showFooter, setShowFooter] = useState(true);
+  const [showPhotoInfo, setShowPhotoInfo] = useState(false);
+  const [slideshowActive, setSlideshowActive] = useState(false);
+  const [slideshowDuration, setSlideshowDuration] = useState(5000);
+  const [showDurationPicker, setShowDurationPicker] = useState(false);
 
-  // Video viewer (dedicated)
+  // Video viewer
   const [videoVisible, setVideoVisible] = useState(false);
   const [videoUri, setVideoUri] = useState('');
 
-  // Single item actions
-  const [isDeleteModalVisible, setIsDeleteModalVisible] = useState(false);
-  const [selectedImage, setSelectedImage] = useState(null);
-
-  // Comments
-  const [showComments, setShowComments] = useState(false);
+  // Reactions
+  const [showReactions, setShowReactions] = useState(false);
+  const [imageReactions, setImageReactions] = useState({});
 
   // Multi-select
   const [multiSelect, setMultiSelect] = useState(false);
@@ -124,6 +128,9 @@ const GalleryScreen = ({ navigation }) => {
     visible: false,
     message: '',
   });
+
+  // Slideshow timer
+  const slideshowTimer = useRef(null);
 
   // Animations
   useEffect(() => {
@@ -141,7 +148,7 @@ const GalleryScreen = ({ navigation }) => {
     ]).start();
   }, []);
 
-  // Detect native video module (prevents RCTVideo crash on some setups)
+  // Detect native video module
   const videoSupportedRef = useRef(false);
   useEffect(() => {
     try {
@@ -156,7 +163,7 @@ const GalleryScreen = ({ navigation }) => {
     }
   }, []);
 
-  // Log each render summary
+  // Log render summary
   log('Render', {
     loading,
     count: images.length,
@@ -166,9 +173,11 @@ const GalleryScreen = ({ navigation }) => {
     selectedIdsLen: selectedIds.length,
     uploading,
     progress,
+    slideshowActive,
+    slideshowDuration,
   });
 
-  // Load auth + avatar
+  // Load auth + avatar + profile
   const fetchProfileAvatar = useCallback(async () => {
     try {
       const {
@@ -183,12 +192,13 @@ const GalleryScreen = ({ navigation }) => {
       setUserId(user.id);
       const { data, error: pErr } = await supabase
         .from('profiles')
-        .select('avatar_url')
+        .select('avatar_url, username')
         .eq('id', user.id)
         .maybeSingle();
       if (pErr) log('profile fetch error:', pErr);
       setAvatarUrl(data?.avatar_url || '');
-      log('Loaded avatar:', data?.avatar_url);
+      setUserName(data?.username || 'User');
+      log('Loaded profile:', data?.avatar_url, data?.username);
     } catch (e) {
       log('fetchProfileAvatar exception:', e);
     }
@@ -227,8 +237,28 @@ const GalleryScreen = ({ navigation }) => {
     }
   }, []);
 
+  // Fetch reactions for images
+  const fetchReactions = useCallback(async () => {
+    try {
+      const { data: reactions } = await supabase.from('reactions').select('*');
+
+      // Group reactions by image_id
+      const reactionsByImage = {};
+      reactions?.forEach(r => {
+        if (!reactionsByImage[r.image_id]) reactionsByImage[r.image_id] = [];
+        reactionsByImage[r.image_id].push(r);
+      });
+      setImageReactions(reactionsByImage);
+
+      log('Fetched reactions');
+    } catch (e) {
+      log('Error fetching reactions:', e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchImages();
+    fetchReactions();
     const ch = supabase
       .channel('public:images')
       .on(
@@ -244,11 +274,25 @@ const GalleryScreen = ({ navigation }) => {
         },
       )
       .subscribe();
+
+    // Subscribe to reactions changes
+    const reactionsChannel = supabase
+      .channel('public:reactions')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'reactions' },
+        () => {
+          fetchReactions();
+        },
+      )
+      .subscribe();
+
     return () => {
       supabase.removeChannel(ch);
-      log('Realtime channel removed: public:images');
+      supabase.removeChannel(reactionsChannel);
+      log('Realtime channels removed');
     };
-  }, [fetchImages]);
+  }, [fetchImages, fetchReactions]);
 
   // Group by date
   const groupImagesByDate = useCallback(arr => {
@@ -520,23 +564,13 @@ const GalleryScreen = ({ navigation }) => {
               log(
                 'Invoking edge function push-new-image-v1 with image_id:',
                 inserted.id,
-                'debug_notify_self:true',
               );
               const tFn = Date.now();
               const { data: fnRes, error: fnErr } =
                 await supabase.functions.invoke('push-new-image-v1', {
-                  body: { image_id: inserted.id, debug_notify_self: true },
+                  body: { image_id: inserted.id },
                 });
-              log('Function response:', fnRes, fnErr);
-              if (fnRes && fnRes.fcmResults) {
-                log('FCM Results:', JSON.stringify(fnRes.fcmResults, null, 2));
-              }
-
               const fnMs = Date.now() - tFn;
-
-              // Log the full function response, including fcmResults
-              log('Function response:', fnRes, fnErr);
-
               if (fnErr) {
                 log(
                   'Edge function push-new-image-v1 ERROR:',
@@ -545,12 +579,7 @@ const GalleryScreen = ({ navigation }) => {
                   fnMs,
                 );
               } else {
-                log(
-                  'Edge function push-new-image-v1 OK. Response:',
-                  fnRes,
-                  'durationMs:',
-                  fnMs,
-                );
+                log('Edge function push-new-image-v1 OK.', 'durationMs:', fnMs);
               }
             } catch (fnCatch) {
               log('Edge function invoke exception:', fnCatch);
@@ -591,6 +620,7 @@ const GalleryScreen = ({ navigation }) => {
     setRefreshing(true);
     log('Pull-to-refresh triggered.');
     fetchImages();
+    fetchReactions();
   };
 
   // Open item (photo or video)
@@ -618,7 +648,9 @@ const GalleryScreen = ({ navigation }) => {
       setPhotoViewerIndex(Math.max(0, idx));
       setIsViewerVisible(true);
       setShowFooter(true);
-      setShowComments(false);
+      setShowReactions(false);
+      setShowPhotoInfo(false);
+      setShowDurationPicker(false);
       log('Open photo viewer for id:', item.id, 'photoIndex:', idx);
     }
   };
@@ -659,7 +691,9 @@ const GalleryScreen = ({ navigation }) => {
       log('Shared photo:', img.image_url);
     } catch (e) {
       log('Share error:', e);
-      setErrorModal({ visible: true, message: e.message });
+      if (e?.message !== 'User did not share') {
+        setErrorModal({ visible: true, message: e.message });
+      }
     }
   };
 
@@ -667,20 +701,95 @@ const GalleryScreen = ({ navigation }) => {
     try {
       const img = photosOnly[photoViewerIndex];
       if (!img) return;
+
+      // Request permissions for Android
+      if (Platform.OS === 'android') {
+        try {
+          const androidVersion = Platform.Version;
+
+          if (androidVersion >= 33) {
+            // Android 13+
+            const granted = await PermissionsAndroid.requestMultiple([
+              PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
+              PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
+            ]);
+
+            const allGranted = Object.values(granted).every(
+              p => p === PermissionsAndroid.RESULTS.GRANTED,
+            );
+
+            if (!allGranted) {
+              setErrorModal({
+                visible: true,
+                message: 'Storage permission required',
+              });
+              return;
+            }
+          } else {
+            // Android 12 and below
+            const granted = await PermissionsAndroid.request(
+              PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+              {
+                title: 'Storage Permission Required',
+                message: 'This app needs access to your storage to save photos',
+                buttonNeutral: 'Ask Me Later',
+                buttonNegative: 'Cancel',
+                buttonPositive: 'OK',
+              },
+            );
+
+            if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+              setErrorModal({
+                visible: true,
+                message: 'Storage permission required',
+              });
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn('Permission error:', err);
+        }
+      }
+
       const fileUrl = img.image_url;
-      const fileName = fileUrl.split('/').pop();
+      const fileName =
+        img.file_name || fileUrl.split('/').pop() || `image_${Date.now()}.jpg`;
       const dirs = BlobUtil.fs.dirs;
+
       const dest =
         Platform.OS === 'android'
-          ? `${dirs.DownloadDir}/${fileName}`
+          ? `${dirs.PictureDir}/Gallery/${fileName}`
           : `${dirs.DocumentDir}/${fileName}`;
+
       log('Saving file to device...', { dest, fileUrl });
-      await BlobUtil.config({ path: dest }).fetch('GET', fileUrl);
-      setSuccessModal({ visible: true, message: 'Saved to device.' });
+
+      if (Platform.OS === 'android') {
+        const configOptions = {
+          fileCache: true,
+          addAndroidDownloads: {
+            useDownloadManager: true,
+            notification: true,
+            mediaScannable: true,
+            title: fileName,
+            path: dest,
+            description: 'Downloading image...',
+          },
+        };
+
+        await BlobUtil.config(configOptions).fetch('GET', fileUrl);
+        ToastAndroid.show(
+          `Saved to Pictures/Gallery/${fileName}`,
+          ToastAndroid.LONG,
+        );
+      } else {
+        await BlobUtil.config({ path: dest }).fetch('GET', fileUrl);
+      }
+
+      setSuccessModal({ visible: true, message: 'Image saved successfully!' });
       log('Saved file to:', dest);
     } catch (e) {
       log('Save error:', e);
-      setErrorModal({ visible: true, message: e.message });
+      setErrorModal({ visible: true, message: 'Failed to save: ' + e.message });
     }
   };
 
@@ -702,6 +811,118 @@ const GalleryScreen = ({ navigation }) => {
       log('Toggle favorite error:', e);
     }
   };
+
+  // Toggle reaction (Instagram-style)
+  const toggleReaction = async emoji => {
+    const img = photosOnly[photoViewerIndex];
+    if (!img) return;
+
+    try {
+      // Check if user already reacted with this emoji
+      const existingReactions = imageReactions[img.id] || [];
+      const userReaction = existingReactions.find(
+        r => r.user_id === userId && r.emoji === emoji,
+      );
+
+      if (userReaction) {
+        // Remove reaction if already exists
+        log('Removing reaction:', emoji, 'from image:', img.id);
+        const { error } = await supabase
+          .from('reactions')
+          .delete()
+          .match({ image_id: img.id, user_id: userId, emoji });
+
+        if (error) throw error;
+
+        // Update local state
+        setImageReactions(prev => ({
+          ...prev,
+          [img.id]: prev[img.id].filter(
+            r => !(r.user_id === userId && r.emoji === emoji),
+          ),
+        }));
+
+        log('Removed reaction successfully');
+      } else {
+        // Add new reaction
+        log('Adding reaction:', emoji, 'to image:', img.id);
+        Animated.sequence([
+          Animated.timing(reactionAnim, {
+            toValue: 1,
+            duration: 300,
+            useNativeDriver: true,
+          }),
+          Animated.timing(reactionAnim, {
+            toValue: 0,
+            duration: 200,
+            useNativeDriver: true,
+          }),
+        ]).start();
+
+        const { error } = await supabase.from('reactions').insert({
+          image_id: img.id,
+          user_id: userId,
+          emoji,
+          created_at: new Date().toISOString(),
+        });
+
+        if (error) throw error;
+
+        // Update local state immediately
+        setImageReactions(prev => ({
+          ...prev,
+          [img.id]: [...(prev[img.id] || []), { user_id: userId, emoji }],
+        }));
+
+        log('Added reaction successfully');
+      }
+    } catch (e) {
+      log('Error toggling reaction:', e);
+      setErrorModal({ visible: true, message: 'Failed to update reaction' });
+    }
+  };
+
+  // Start/stop slideshow with custom duration
+  const toggleSlideshow = () => {
+    if (slideshowActive) {
+      clearInterval(slideshowTimer.current);
+      setSlideshowActive(false);
+      log('Slideshow stopped');
+    } else {
+      setSlideshowActive(true);
+      slideshowTimer.current = setInterval(() => {
+        setPhotoViewerIndex(prev => {
+          const next = (prev + 1) % photosOnly.length;
+          log('Slideshow next photo:', next, 'duration:', slideshowDuration);
+          return next;
+        });
+      }, slideshowDuration);
+      log('Slideshow started with duration:', slideshowDuration);
+    }
+  };
+
+  // Update slideshow when duration changes
+  useEffect(() => {
+    if (slideshowActive) {
+      clearInterval(slideshowTimer.current);
+      slideshowTimer.current = setInterval(() => {
+        setPhotoViewerIndex(prev => {
+          const next = (prev + 1) % photosOnly.length;
+          return next;
+        });
+      }, slideshowDuration);
+      log('Slideshow duration updated to:', slideshowDuration);
+    }
+  }, [slideshowDuration, slideshowActive, photosOnly.length]);
+
+  // Cleanup slideshow on unmount
+  useEffect(() => {
+    return () => {
+      if (slideshowTimer.current) {
+        clearInterval(slideshowTimer.current);
+      }
+    };
+  }, []);
 
   // Multi-select helpers
   const toggleSelect = id => {
@@ -752,7 +973,6 @@ const GalleryScreen = ({ navigation }) => {
   const handleBatchFavoriteToggle = async () => {
     if (!selectedIds.length) return;
     try {
-      // If any is not favorite, set all to true; else set all to false
       const selectedItems = images.filter(i => selectedIds.includes(i.id));
       const makeFav = selectedItems.some(i => !i.favorite);
       await supabase
@@ -778,79 +998,7 @@ const GalleryScreen = ({ navigation }) => {
     log('Selected all:', ids.length);
   };
 
-  // Debug: send push for the latest image (notify self)
-  const debugSendPushForLatestImage = async () => {
-    try {
-      log('[Debug] Sending push for latest image (notify self)...');
-      const { data, error } = await supabase
-        .from('images')
-        .select('id')
-        .order('created_at', { ascending: false })
-        .limit(1);
-      if (error) throw error;
-      const latestId = data?.[0]?.id;
-      if (!latestId) {
-        Alert.alert(
-          'Debug Push',
-          'No images found. Upload an image or video first.',
-        );
-        return;
-      }
-      const tFn = Date.now();
-      const { data: fnRes, error: fnErr } = await supabase.functions.invoke(
-        'push-new-image-v1',
-        { body: { image_id: latestId, debug_notify_self: true } },
-      );
-      const ms = Date.now() - tFn;
-      if (fnErr) {
-        log('[Debug] push-new-image-v1 ERROR:', fnErr, 'ms:', ms);
-        Alert.alert(
-          'Debug Push',
-          'Function error. Open Supabase → Logs → Edge Functions.',
-        );
-      } else {
-        log('[Debug] push-new-image-v1 OK:', fnRes, 'ms:', ms);
-        Alert.alert('Debug Push', 'Invoked. Check your notifications.');
-      }
-    } catch (e) {
-      log('[Debug] Exception:', e);
-      Alert.alert('Debug Push', e?.message || String(e));
-    }
-  };
-
-  // Debug: log tokens for current user
-  const debugLogMyTokens = async () => {
-    try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) {
-        log('[Debug] No user.');
-        Alert.alert('Tokens', 'No logged-in user.');
-        return;
-      }
-      const { data, error } = await supabase
-        .from('devices')
-        .select('token, platform, updated_at')
-        .eq('user_id', user.id);
-      if (error) {
-        log('[Debug] devices select error:', error);
-        Alert.alert('Tokens', error.message);
-        return;
-      }
-      log('[Debug] My tokens:', data);
-      Alert.alert(
-        'Tokens',
-        data?.length
-          ? `Found ${data.length} token(s) for your user. See console for details.`
-          : 'No tokens found for this user. Ensure App.js registers FCM token.',
-      );
-    } catch (e) {
-      log('[Debug] tokens exception:', e);
-    }
-  };
-
-  // Render each date section (show up to 4 and "See All" link)
+  // Render each date section
   const renderSection = (date, imagesArr) => {
     const showSeeAll = imagesArr.length > 4;
     const imagesToShow = showSeeAll ? imagesArr.slice(0, 4) : imagesArr;
@@ -960,14 +1108,11 @@ const GalleryScreen = ({ navigation }) => {
               colors={theme.gradient}
               style={styles.avatarGradient}
             >
-              <Image
-                source={
-                  avatarUrl
-                    ? { uri: avatarUrl }
-                    : require('../assets/default-avatar.jpg')
-                }
-                style={styles.avatar}
-              />
+              {avatarUrl ? (
+                <Image source={{ uri: avatarUrl }} style={styles.avatar} />
+              ) : (
+                <Icon name="person" size={24} color="#FFFFFF" />
+              )}
             </LinearGradient>
           </TouchableOpacity>
 
@@ -995,16 +1140,6 @@ const GalleryScreen = ({ navigation }) => {
                   <Text style={styles.menuOption}>Shared Calendar</Text>
                 </View>
               </MenuOption>
-              <MenuOption onSelect={() => navigation.navigate('PrivateChat')}>
-                <View style={styles.menuOptionContainer}>
-                  <Icon
-                    name="chatbubbles"
-                    size={20}
-                    color={theme.shared.orange}
-                  />
-                  <Text style={styles.menuOption}>Private Chat</Text>
-                </View>
-              </MenuOption>
               <MenuOption onSelect={() => navigation.navigate('PhotoVault')}>
                 <View style={styles.menuOptionContainer}>
                   <Icon
@@ -1015,29 +1150,18 @@ const GalleryScreen = ({ navigation }) => {
                   <Text style={styles.menuOption}>Photo Vault</Text>
                 </View>
               </MenuOption>
-
-              {/* Debug items */}
-              <MenuOption onSelect={debugSendPushForLatestImage}>
+              <MenuOption
+                onSelect={() => navigation.navigate('Personalization')}
+              >
                 <View style={styles.menuOptionContainer}>
                   <Icon
-                    name="notifications"
+                    name="color-palette"
                     size={20}
-                    color={theme.shared.green}
+                    color={theme.shared.orange}
                   />
-                  <Text style={styles.menuOption}>Test Push (notify me)</Text>
+                  <Text style={styles.menuOption}>Personalization</Text>
                 </View>
               </MenuOption>
-              <MenuOption onSelect={debugLogMyTokens}>
-                <View style={styles.menuOptionContainer}>
-                  <Icon
-                    name="phone-portrait"
-                    size={20}
-                    color={theme.shared.yellow}
-                  />
-                  <Text style={styles.menuOption}>Log my device tokens</Text>
-                </View>
-              </MenuOption>
-
               <MenuOption
                 onSelect={async () => {
                   await supabase.auth.signOut();
@@ -1155,14 +1279,21 @@ const GalleryScreen = ({ navigation }) => {
           >
             <Icon name="search" size={20} color={theme.colors.primary} />
             <TextInput
-              style={[styles.searchInput, { color: theme.text }]}
+              style={[
+                styles.searchInput,
+                {
+                  color: theme.colors.primary,
+                  fontWeight: '500',
+                },
+              ]}
               placeholder="Search memories..."
-              placeholderTextColor={theme.gray.medium}
+              placeholderTextColor={theme.colors.primary + '60'}
               value={search}
               onChangeText={t => {
                 setSearch(t);
                 log('Search changed:', t);
               }}
+              selectionColor={theme.colors.primary}
             />
             <TouchableOpacity
               onPress={() => setShowFilterDropdown(v => !v)}
@@ -1258,7 +1389,7 @@ const GalleryScreen = ({ navigation }) => {
           activeOpacity={0.8}
         >
           <LinearGradient colors={theme.gradient} style={styles.fabGradient}>
-            <Icon name="add" size={32} color="#FFFFFF" />
+            <Icon name="cloud-upload" size={28} color="#FFFFFF" />
           </LinearGradient>
         </TouchableOpacity>
 
@@ -1285,24 +1416,182 @@ const GalleryScreen = ({ navigation }) => {
           </Animated.View>
         )}
 
-        {/* Photo Viewer */}
+        {/* Enhanced Photo Viewer with Instagram-like features */}
         <ImageViewing
           images={photosOnly.map(img => ({ uri: img.image_url }))}
           imageIndex={photoViewerIndex}
           visible={isViewerVisible}
-          onRequestClose={() => setIsViewerVisible(false)}
+          onRequestClose={() => {
+            setIsViewerVisible(false);
+            if (slideshowActive) toggleSlideshow();
+          }}
           doubleTapToZoomEnabled
           swipeToCloseEnabled
-          onImageIndexChange={() => {
+          onImageIndexChange={idx => {
+            setPhotoViewerIndex(idx);
             setShowFooter(true);
-            setShowComments(false);
+            setShowReactions(false);
+            setShowPhotoInfo(false);
+            setShowDurationPicker(false);
           }}
-          imageContainerStyle={{ marginBottom: showFooter ? 180 : 0 }}
+          HeaderComponent={() => (
+            <LinearGradient
+              colors={['rgba(0,0,0,0.7)', 'transparent']}
+              style={styles.viewerHeader}
+            >
+              <TouchableOpacity
+                onPress={() => {
+                  setIsViewerVisible(false);
+                  if (slideshowActive) toggleSlideshow();
+                }}
+                style={styles.viewerCloseButton}
+              >
+                <Icon name="close" size={28} color="#FFFFFF" />
+              </TouchableOpacity>
+              <View style={styles.viewerHeaderActions}>
+                <TouchableOpacity
+                  onPress={() => setShowDurationPicker(v => !v)}
+                  style={styles.viewerHeaderButton}
+                >
+                  <Icon name="time" size={24} color="#FFFFFF" />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={toggleSlideshow}
+                  style={styles.viewerHeaderButton}
+                >
+                  <Icon
+                    name={slideshowActive ? 'pause' : 'play'}
+                    size={24}
+                    color="#FFFFFF"
+                  />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => setShowPhotoInfo(v => !v)}
+                  style={styles.viewerHeaderButton}
+                >
+                  <Icon name="information-circle" size={24} color="#FFFFFF" />
+                </TouchableOpacity>
+              </View>
+            </LinearGradient>
+          )}
           FooterComponent={() => {
             const img = photosOnly[photoViewerIndex];
             if (!img) return null;
+            const reactions = imageReactions[img.id] || [];
+
             return (
               <View>
+                {/* Slideshow Duration Picker */}
+                {showDurationPicker && (
+                  <View style={styles.durationPicker}>
+                    {SLIDESHOW_DURATIONS.map(duration => (
+                      <TouchableOpacity
+                        key={duration.value}
+                        onPress={() => {
+                          setSlideshowDuration(duration.value);
+                          setShowDurationPicker(false);
+                          log('Slideshow duration set to:', duration.label);
+                        }}
+                        style={[
+                          styles.durationOption,
+                          slideshowDuration === duration.value &&
+                            styles.durationOptionActive,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.durationText,
+                            slideshowDuration === duration.value &&
+                              styles.durationTextActive,
+                          ]}
+                        >
+                          {duration.label}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
+
+                {/* Photo Info Panel */}
+                {showPhotoInfo && (
+                  <LinearGradient
+                    colors={['transparent', 'rgba(0,0,0,0.9)']}
+                    style={styles.photoInfoPanel}
+                  >
+                    <Text style={styles.photoInfoTitle}>Photo Details</Text>
+                    <Text style={styles.photoInfoText}>
+                      Name: {img.file_name || 'Untitled'}
+                    </Text>
+                    <Text style={styles.photoInfoText}>
+                      Date: {format(parseISO(img.created_at), 'PPpp')}
+                    </Text>
+                    <Text style={styles.photoInfoText}>
+                      Storage: {img.storage_type}
+                    </Text>
+                    <Text style={styles.photoInfoText}>Type: {img.type}</Text>
+                  </LinearGradient>
+                )}
+
+                {/* Instagram-style reactions with transparent background */}
+                {showReactions && (
+                  <View style={styles.reactionsContainer}>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                    >
+                      {REACTIONS.map((emoji, idx) => {
+                        const hasReacted = reactions.some(
+                          r => r.user_id === userId && r.emoji === emoji,
+                        );
+                        return (
+                          <TouchableOpacity
+                            key={idx}
+                            onPress={() => toggleReaction(emoji)}
+                            style={[
+                              styles.reactionButton,
+                              hasReacted && styles.reactionButtonActive,
+                            ]}
+                          >
+                            <Animated.Text
+                              style={[
+                                styles.reactionEmoji,
+                                {
+                                  transform: [
+                                    {
+                                      scale: hasReacted ? 1.2 : 1,
+                                    },
+                                  ],
+                                },
+                              ]}
+                            >
+                              {emoji}
+                            </Animated.Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </ScrollView>
+                  </View>
+                )}
+
+                {/* Display reactions */}
+                {reactions.length > 0 && (
+                  <View style={styles.reactionsDisplay}>
+                    <View style={styles.reactionsRow}>
+                      {reactions.slice(0, 5).map((r, idx) => (
+                        <Text key={idx} style={styles.displayedReaction}>
+                          {r.emoji}
+                        </Text>
+                      ))}
+                      {reactions.length > 5 && (
+                        <Text style={styles.moreReactions}>
+                          +{reactions.length - 5}
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                )}
+
+                {/* Main Footer Actions */}
                 <LinearGradient
                   colors={['transparent', 'rgba(0,0,0,0.8)']}
                   style={styles.viewerFooter}
@@ -1326,8 +1615,14 @@ const GalleryScreen = ({ navigation }) => {
                     <Icon
                       name={img.favorite ? 'heart' : 'heart-outline'}
                       size={24}
-                      color={theme.shared.red}
+                      color={img.favorite ? theme.shared.red : '#FFFFFF'}
                     />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.viewerButton}
+                    onPress={() => setShowReactions(v => !v)}
+                  >
+                    <Icon name="happy" size={24} color="#FFFFFF" />
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.viewerButton}
@@ -1335,30 +1630,13 @@ const GalleryScreen = ({ navigation }) => {
                   >
                     <Icon name="trash" size={24} color={theme.shared.red} />
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.viewerButton}
-                    onPress={() => setShowComments(v => !v)}
-                  >
-                    <Icon
-                      name="chatbubble-ellipses"
-                      size={24}
-                      color="#FFFFFF"
-                    />
-                  </TouchableOpacity>
                 </LinearGradient>
-                {showComments && (
-                  <CommentsSection
-                    imageId={img.id}
-                    userId={userId}
-                    theme={theme}
-                  />
-                )}
               </View>
             );
           }}
         />
 
-        {/* Video Viewer (dedicated) */}
+        {/* Video Viewer */}
         <Modal
           isVisible={videoVisible}
           onBackdropPress={() => setVideoVisible(false)}
@@ -1445,12 +1723,15 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 4,
     shadowOffset: { width: 0, height: 2 },
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   avatar: {
     width: 40,
     height: 40,
     borderRadius: 20,
     backgroundColor: '#FFF',
+    resizeMode: 'cover',
   },
   headerTitleContainer: {
     flex: 1,
@@ -1558,9 +1839,9 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   fabGradient: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     justifyContent: 'center',
     alignItems: 'center',
     elevation: 8,
@@ -1572,7 +1853,7 @@ const styles = StyleSheet.create({
 
   uploadStatus: {
     position: 'absolute',
-    bottom: 160,
+    bottom: 140,
     alignSelf: 'center',
     zIndex: 10,
   },
@@ -1617,6 +1898,31 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
 
+  viewerHeader: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: Platform.OS === 'ios' ? 50 : 20,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    zIndex: 10,
+  },
+  viewerCloseButton: {
+    padding: 8,
+  },
+  viewerHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  viewerHeaderButton: {
+    padding: 8,
+    marginLeft: 16,
+  },
+
   viewerFooter: {
     flexDirection: 'row',
     justifyContent: 'center',
@@ -1629,11 +1935,96 @@ const styles = StyleSheet.create({
   },
   viewerButton: {
     backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
     borderRadius: 25,
     marginHorizontal: 4,
-    backdropFilter: 'blur(10px)',
+  },
+
+  durationPicker: {
+    position: 'absolute',
+    top: 80,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    borderRadius: 12,
+    padding: 8,
+  },
+  durationOption: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    marginVertical: 2,
+  },
+  durationOptionActive: {
+    backgroundColor: 'rgba(255,255,255,0.2)',
+  },
+  durationText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+  },
+  durationTextActive: {
+    fontWeight: 'bold',
+  },
+
+  photoInfoPanel: {
+    position: 'absolute',
+    bottom: 180,
+    left: 20,
+    right: 20,
+    padding: 20,
+    borderRadius: 16,
+  },
+  photoInfoTitle: {
+    color: '#FFFFFF',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 12,
+  },
+  photoInfoText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    marginVertical: 2,
+  },
+
+  // FIXED: Transparent background for reactions
+  reactionsContainer: {
+    position: 'absolute',
+    bottom: 100,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: 'transparent', // No background color - fully transparent
+  },
+  reactionButton: {
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+  },
+  reactionButtonActive: {
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 20,
+  },
+  reactionEmoji: {
+    fontSize: 30,
+  },
+
+  reactionsDisplay: {
+    position: 'absolute',
+    bottom: 160,
+    left: 20,
+  },
+  reactionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  displayedReaction: {
+    fontSize: 20,
+    marginRight: 4,
+  },
+  moreReactions: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    marginLeft: 8,
   },
 
   dropdown: {
@@ -1704,10 +2095,10 @@ export default GalleryScreen;
 // // - Keeps the rest of your behavior, styles at the bottom are the same as you shared.
 // // - No references to 'active' column (your devices table doesn't have it).
 // // - If you still don't see notifications:
-// //    1) Make sure Android 13+ POST_NOTIFICATIONS permission is granted.
-// //    2) Ensure App.js registers your FCM token to public.devices.
-// //    3) Deploy the edge function with secrets set (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, FCM_SERVER_KEY).
-// //    4) Watch Supabase → Logs & Analytics → Edge Functions during a test push/upload.
+// // 1) Make sure Android 13+ POST_NOTIFICATIONS permission is granted.
+// // 2) Ensure App.js registers your FCM token to public.devices.
+// // 3) Deploy the edge function with secrets set (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, FCM_SERVER_KEY).
+// // 4) Watch Supabase → Logs & Analytics → Edge Functions during a test push/upload.
 
 // import React, {
 //   useState,
@@ -1732,6 +2123,7 @@ export default GalleryScreen;
 //   RefreshControl,
 //   UIManager,
 //   Linking,
+//   Animated,
 // } from 'react-native';
 // import { SafeAreaView } from 'react-native-safe-area-context';
 // import { useTheme } from '../theme/ThemeContext';
@@ -1754,6 +2146,8 @@ export default GalleryScreen;
 // } from 'react-native-popup-menu';
 // import CommentsSection from '../components/CommentsSection';
 // import { useFocusEffect } from '@react-navigation/native';
+// import LinearGradient from 'react-native-linear-gradient';
+// import { BlurView } from '@react-native-community/blur';
 
 // const log = (...a) => console.log('[Gallery]', ...a);
 
@@ -1763,18 +2157,20 @@ export default GalleryScreen;
 
 // // Filter options
 // const FILTERS = [
-//   { label: 'All', value: 'all' },
-//   { label: 'Photos', value: 'photo' },
-//   { label: 'Videos', value: 'video' },
-//   { label: 'Favorites', value: 'favorites' },
-//   { label: 'This Month', value: 'month' },
-//   { label: 'This Week', value: 'week' },
+//   { label: 'All', value: 'all', icon: 'albums', color: '#667EEA' },
+//   { label: 'Photos', value: 'photo', icon: 'image', color: '#FF6B9D' },
+//   { label: 'Videos', value: 'video', icon: 'videocam', color: '#06FFA5' },
+//   { label: 'Favorites', value: 'favorites', icon: 'heart', color: '#E63946' },
+//   { label: 'This Month', value: 'month', icon: 'calendar', color: '#FFD60A' },
+//   { label: 'This Week', value: 'week', icon: 'today', color: '#00D4FF' },
 // ];
 
 // const { width } = Dimensions.get('window');
 
 // const GalleryScreen = ({ navigation }) => {
 //   const { theme } = useTheme();
+//   const fadeAnim = useRef(new Animated.Value(0)).current;
+//   const scaleAnim = useRef(new Animated.Value(0.9)).current;
 
 //   // Data
 //   const [images, setImages] = useState([]);
@@ -1818,6 +2214,22 @@ export default GalleryScreen;
 //     visible: false,
 //     message: '',
 //   });
+
+//   // Animations
+//   useEffect(() => {
+//     Animated.parallel([
+//       Animated.timing(fadeAnim, {
+//         toValue: 1,
+//         duration: 1000,
+//         useNativeDriver: true,
+//       }),
+//       Animated.spring(scaleAnim, {
+//         toValue: 1,
+//         friction: 4,
+//         useNativeDriver: true,
+//       }),
+//     ]).start();
+//   }, []);
 
 //   // Detect native video module (prevents RCTVideo crash on some setups)
 //   const videoSupportedRef = useRef(false);
@@ -2194,7 +2606,6 @@ export default GalleryScreen;
 //             log('Supabase insert success. Inserted row:', inserted);
 
 //             // Edge Function: push notification for new item
-//             // Edge Function: push notification for new item
 //             try {
 //               log(
 //                 'Invoking edge function push-new-image-v1 with image_id:',
@@ -2535,23 +2946,49 @@ export default GalleryScreen;
 //     const imagesToShow = showSeeAll ? imagesArr.slice(0, 4) : imagesArr;
 
 //     return (
-//       <View key={date} style={styles.section}>
-//         <View style={styles.sectionHeader}>
-//           <Text style={styles.sectionTitle}>
-//             {isToday(parseISO(date))
-//               ? 'Today'
-//               : format(parseISO(date), 'MMMM d, yyyy')}
-//           </Text>
-//           {showSeeAll && (
-//             <TouchableOpacity
-//               onPress={() =>
-//                 navigation.navigate('DayGallery', { date, images: imagesArr })
-//               }
+//       <Animated.View
+//         key={date}
+//         style={[
+//           styles.section,
+//           {
+//             opacity: fadeAnim,
+//             transform: [{ scale: scaleAnim }],
+//           },
+//         ]}
+//       >
+//         <LinearGradient
+//           colors={[theme.colors.ultraLight, 'transparent']}
+//           start={{ x: 0, y: 0 }}
+//           end={{ x: 1, y: 0 }}
+//           style={styles.sectionHeaderGradient}
+//         >
+//           <View style={styles.sectionHeader}>
+//             <Text
+//               style={[styles.sectionTitle, { color: theme.colors.primary }]}
 //             >
-//               <Text style={styles.seeAll}>See All</Text>
-//             </TouchableOpacity>
-//           )}
-//         </View>
+//               {isToday(parseISO(date))
+//                 ? '✨ Today'
+//                 : format(parseISO(date), 'MMMM d, yyyy')}
+//             </Text>
+//             {showSeeAll && (
+//               <TouchableOpacity
+//                 onPress={() =>
+//                   navigation.navigate('DayGallery', { date, images: imagesArr })
+//                 }
+//                 style={styles.seeAllButton}
+//               >
+//                 <LinearGradient
+//                   colors={theme.gradient}
+//                   start={{ x: 0, y: 0 }}
+//                   end={{ x: 1, y: 0 }}
+//                   style={styles.seeAllGradient}
+//                 >
+//                   <Text style={styles.seeAll}>See All</Text>
+//                 </LinearGradient>
+//               </TouchableOpacity>
+//             )}
+//           </View>
+//         </LinearGradient>
 //         <FlatList
 //           data={imagesToShow}
 //           numColumns={2}
@@ -2567,484 +3004,785 @@ export default GalleryScreen;
 //           )}
 //           scrollEnabled={false}
 //         />
-//       </View>
+//       </Animated.View>
 //     );
 //   };
 
 //   // Loading UI
 //   if (loading) {
 //     return (
-//       <SafeAreaView style={styles.loader}>
-//         <ActivityIndicator size="large" color={theme.colors.primary} />
-//         <Text style={{ color: theme.colors.text, marginTop: 10 }}>
-//           Loading gallery...
-//         </Text>
-//       </SafeAreaView>
+//       <LinearGradient colors={theme.gradient} style={styles.loader}>
+//         <ActivityIndicator size="large" color="#FFFFFF" />
+//         <Text style={styles.loadingText}>Loading your memories...</Text>
+//       </LinearGradient>
 //     );
 //   }
 
 //   // Main UI
 //   return (
-//     <SafeAreaView
-//       style={[
-//         styles.container,
-//         { backgroundColor: theme.colors.primary + '20' },
-//       ]}
+//     <LinearGradient
+//       colors={[theme.colors.ultraLight, '#FFFFFF', theme.colors.light]}
+//       style={styles.container}
 //     >
-//       {/* Header */}
-//       <View style={styles.header}>
-//         <TouchableOpacity onPress={() => navigation.navigate('Profile')}>
-//           <Image
-//             source={
-//               avatarUrl
-//                 ? { uri: avatarUrl }
-//                 : require('../assets/default-avatar.jpg')
-//             }
-//             style={styles.avatar}
-//           />
-//         </TouchableOpacity>
-//         <Text style={styles.headerTitle}>Gallery</Text>
-//         <Menu>
-//           <MenuTrigger>
-//             <Icon
-//               name="ellipsis-vertical"
-//               size={28}
-//               color={theme.colors.primary}
-//             />
-//           </MenuTrigger>
-//           <MenuOptions>
-//             <MenuOption onSelect={() => navigation.navigate('SharedCalendar')}>
-//               <Text style={styles.menuOption}>Shared Calendar</Text>
-//             </MenuOption>
-//             <MenuOption onSelect={() => navigation.navigate('PrivateChat')}>
-//               <Text style={styles.menuOption}>Private Chat</Text>
-//             </MenuOption>
-//             <MenuOption onSelect={() => navigation.navigate('PhotoVault')}>
-//               <Text style={styles.menuOption}>Photo Vault</Text>
-//             </MenuOption>
-
-//             {/* Debug items */}
-//             <MenuOption onSelect={debugSendPushForLatestImage}>
-//               <Text style={styles.menuOption}>Test Push (notify me)</Text>
-//             </MenuOption>
-//             <MenuOption onSelect={debugLogMyTokens}>
-//               <Text style={styles.menuOption}>Log my device tokens</Text>
-//             </MenuOption>
-
-//             <MenuOption
-//               onSelect={async () => {
-//                 await supabase.auth.signOut();
-//                 navigation.reset({
-//                   index: 0,
-//                   routes: [{ name: 'ProfileSelector' }],
-//                 });
-//               }}
-//             >
-//               <Text style={[styles.menuOption, { color: '#FF6347' }]}>
-//                 Sign Out
-//               </Text>
-//             </MenuOption>
-//           </MenuOptions>
-//         </Menu>
-//       </View>
-
-//       {/* Multi-select bar */}
-//       {multiSelect && (
-//         <View style={styles.multiSelectBar}>
-//           <Text style={{ color: theme.colors.primary, fontWeight: 'bold' }}>
-//             {selectedIds.length} selected
-//           </Text>
-//           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-//             <TouchableOpacity
-//               onPress={handleBatchShare}
-//               style={{ marginHorizontal: 8 }}
-//             >
-//               <Icon
-//                 name="share-social-outline"
-//                 size={22}
-//                 color={theme.colors.primary}
-//               />
-//             </TouchableOpacity>
-//             <TouchableOpacity
-//               onPress={handleBatchFavoriteToggle}
-//               style={{ marginHorizontal: 8 }}
-//             >
-//               <Icon name="heart" size={22} color="#FF80AB" />
-//             </TouchableOpacity>
-//             <TouchableOpacity
-//               onPress={handleBatchDelete}
-//               style={{ marginHorizontal: 8 }}
-//             >
-//               <Icon name="trash" size={22} color="#FF6347" />
-//             </TouchableOpacity>
-//             <TouchableOpacity
-//               onPress={handleSelectAll}
-//               style={{ marginHorizontal: 8 }}
-//             >
-//               <Icon
-//                 name="checkmark-done"
-//                 size={22}
-//                 color={theme.colors.primary}
-//               />
-//             </TouchableOpacity>
-//             <TouchableOpacity
-//               onPress={() => {
-//                 setMultiSelect(false);
-//                 setSelectedIds([]);
-//               }}
-//               style={{ marginHorizontal: 8 }}
-//             >
-//               <Icon name="close" size={22} color="#888" />
-//             </TouchableOpacity>
-//           </View>
-//         </View>
-//       )}
-
-//       {/* Search + Filter + toggle */}
-//       <View style={styles.searchBar}>
-//         <Icon name="search" size={20} color="#aaa" />
-//         <TextInput
-//           style={styles.searchInput}
-//           placeholder="Search by file or date"
-//           placeholderTextColor="#aaa"
-//           value={search}
-//           onChangeText={t => {
-//             setSearch(t);
-//             log('Search changed:', t);
-//           }}
-//         />
-//         <TouchableOpacity onPress={() => setShowFilterDropdown(v => !v)}>
-//           <Icon name="filter" size={22} color={theme.colors.primary} />
-//         </TouchableOpacity>
-//         <TouchableOpacity
-//           onPress={() => setMultiSelect(v => !v)}
-//           style={{ marginLeft: 8 }}
-//         >
-//           <Icon
-//             name={multiSelect ? 'checkbox' : 'checkbox-outline'}
-//             size={22}
-//             color={theme.colors.primary}
-//           />
-//         </TouchableOpacity>
-//       </View>
-
-//       {/* Filter Dropdown */}
-//       {showFilterDropdown && (
-//         <View style={styles.dropdown}>
-//           {FILTERS.map(f => (
-//             <TouchableOpacity
-//               key={f.value}
-//               style={[
-//                 styles.dropdownItem,
-//                 filter === f.value && {
-//                   backgroundColor: theme.colors.primary + '22',
+//       <SafeAreaView style={{ flex: 1 }}>
+//         {/* Header */}
+//         <Animated.View
+//           style={[
+//             styles.header,
+//             {
+//               opacity: fadeAnim,
+//               transform: [
+//                 {
+//                   translateY: fadeAnim.interpolate({
+//                     inputRange: [0, 1],
+//                     outputRange: [-20, 0],
+//                   }),
 //                 },
-//               ]}
-//               onPress={() => {
-//                 setFilter(f.value);
-//                 setShowFilterDropdown(false);
-//                 log('Filter set to:', f.value);
-//               }}
+//               ],
+//             },
+//           ]}
+//         >
+//           <TouchableOpacity
+//             onPress={() => navigation.navigate('Profile')}
+//             style={styles.avatarContainer}
+//           >
+//             <LinearGradient
+//               colors={theme.gradient}
+//               style={styles.avatarGradient}
 //             >
-//               <Text
-//                 style={{
-//                   color: theme.colors.primary,
-//                   fontWeight: filter === f.value ? 'bold' : 'normal',
+//               <Image
+//                 source={
+//                   avatarUrl
+//                     ? { uri: avatarUrl }
+//                     : require('../assets/default-avatar.jpg')
+//                 }
+//                 style={styles.avatar}
+//               />
+//             </LinearGradient>
+//           </TouchableOpacity>
+
+//           <LinearGradient
+//             colors={theme.gradient}
+//             start={{ x: 0, y: 0 }}
+//             end={{ x: 1, y: 0 }}
+//             style={styles.headerTitleContainer}
+//           >
+//             <Text style={styles.headerTitle}>Our Gallery 💕</Text>
+//           </LinearGradient>
+
+//           <Menu>
+//             <MenuTrigger>
+//               <View style={styles.menuTrigger}>
+//                 <Icon name="sparkles" size={24} color={theme.colors.primary} />
+//               </View>
+//             </MenuTrigger>
+//             <MenuOptions customStyles={menuOptionsStyles}>
+//               <MenuOption
+//                 onSelect={() => navigation.navigate('SharedCalendar')}
+//               >
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon name="calendar" size={20} color={theme.shared.purple} />
+//                   <Text style={styles.menuOption}>Shared Calendar</Text>
+//                 </View>
+//               </MenuOption>
+//               <MenuOption onSelect={() => navigation.navigate('PrivateChat')}>
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon
+//                     name="chatbubbles"
+//                     size={20}
+//                     color={theme.shared.orange}
+//                   />
+//                   <Text style={styles.menuOption}>Private Chat</Text>
+//                 </View>
+//               </MenuOption>
+//               <MenuOption onSelect={() => navigation.navigate('PhotoVault')}>
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon
+//                     name="lock-closed"
+//                     size={20}
+//                     color={theme.shared.gold}
+//                   />
+//                   <Text style={styles.menuOption}>Photo Vault</Text>
+//                 </View>
+//               </MenuOption>
+
+//               {/* Debug items */}
+//               <MenuOption onSelect={debugSendPushForLatestImage}>
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon
+//                     name="notifications"
+//                     size={20}
+//                     color={theme.shared.green}
+//                   />
+//                   <Text style={styles.menuOption}>Test Push (notify me)</Text>
+//                 </View>
+//               </MenuOption>
+//               <MenuOption onSelect={debugLogMyTokens}>
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon
+//                     name="phone-portrait"
+//                     size={20}
+//                     color={theme.shared.yellow}
+//                   />
+//                   <Text style={styles.menuOption}>Log my device tokens</Text>
+//                 </View>
+//               </MenuOption>
+
+//               <MenuOption
+//                 onSelect={async () => {
+//                   await supabase.auth.signOut();
+//                   navigation.reset({
+//                     index: 0,
+//                     routes: [{ name: 'ProfileSelector' }],
+//                   });
 //                 }}
 //               >
-//                 {f.label}
+//                 <View style={styles.menuOptionContainer}>
+//                   <Icon name="log-out" size={20} color={theme.shared.red} />
+//                   <Text
+//                     style={[styles.menuOption, { color: theme.shared.red }]}
+//                   >
+//                     Sign Out
+//                   </Text>
+//                 </View>
+//               </MenuOption>
+//             </MenuOptions>
+//           </Menu>
+//         </Animated.View>
+
+//         {/* Multi-select bar */}
+//         {multiSelect && (
+//           <Animated.View
+//             style={[
+//               styles.multiSelectBar,
+//               {
+//                 opacity: fadeAnim,
+//                 transform: [
+//                   {
+//                     translateY: fadeAnim.interpolate({
+//                       inputRange: [0, 1],
+//                       outputRange: [-20, 0],
+//                     }),
+//                   },
+//                 ],
+//               },
+//             ]}
+//           >
+//             <LinearGradient
+//               colors={[
+//                 theme.colors.primary + '20',
+//                 theme.colors.secondary + '10',
+//               ]}
+//               start={{ x: 0, y: 0 }}
+//               end={{ x: 1, y: 0 }}
+//               style={styles.multiSelectGradient}
+//             >
+//               <Text
+//                 style={[styles.selectedText, { color: theme.colors.primary }]}
+//               >
+//                 {selectedIds.length} selected
 //               </Text>
-//             </TouchableOpacity>
-//           ))}
-//         </View>
-//       )}
-
-//       {/* Sections */}
-//       <ScrollView
-//         contentContainerStyle={{ paddingBottom: 120 }}
-//         refreshControl={
-//           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-//         }
-//       >
-//         {Object.keys(groupedImages).map(date =>
-//           renderSection(date, groupedImages[date]),
-//         )}
-//       </ScrollView>
-
-//       {/* Upload FAB */}
-//       <TouchableOpacity style={styles.fab} onPress={handleImagePickAndUpload}>
-//         <Icon name="add" size={30} color="#fff" />
-//       </TouchableOpacity>
-
-//       {/* Upload Progress */}
-//       {uploading && (
-//         <View style={styles.uploadStatus}>
-//           <ActivityIndicator color="white" />
-//           <Text style={styles.uploadText}>Uploading... {progress}%</Text>
-//         </View>
-//       )}
-
-//       {/* Photo Viewer */}
-//       <ImageViewing
-//         images={photosOnly.map(img => ({ uri: img.image_url }))}
-//         imageIndex={photoViewerIndex}
-//         visible={isViewerVisible}
-//         onRequestClose={() => setIsViewerVisible(false)}
-//         doubleTapToZoomEnabled
-//         swipeToCloseEnabled
-//         onImageIndexChange={() => {
-//           setShowFooter(true);
-//           setShowComments(false);
-//         }}
-//         imageContainerStyle={{ marginBottom: showFooter ? 180 : 0 }}
-//         FooterComponent={() => {
-//           const img = photosOnly[photoViewerIndex];
-//           if (!img) return null;
-//           return (
-//             <View>
-//               <View style={styles.viewerFooter}>
+//               <View style={styles.multiSelectActions}>
 //                 <TouchableOpacity
-//                   style={styles.viewerButton}
-//                   onPress={handleShareCurrent}
-//                 >
-//                   <Icon name="share-social-outline" size={22} color="#fff" />
-//                 </TouchableOpacity>
-//                 <TouchableOpacity
-//                   style={styles.viewerButton}
-//                   onPress={handleSaveCurrent}
-//                 >
-//                   <Icon name="download-outline" size={22} color="#fff" />
-//                 </TouchableOpacity>
-//                 <TouchableOpacity
-//                   style={styles.viewerButton}
-//                   onPress={toggleFavoriteCurrent}
+//                   onPress={handleBatchShare}
+//                   style={styles.multiSelectButton}
 //                 >
 //                   <Icon
-//                     name={img.favorite ? 'heart' : 'heart-outline'}
+//                     name="share-social"
 //                     size={22}
-//                     color="#FF80AB"
+//                     color={theme.colors.accent}
 //                   />
 //                 </TouchableOpacity>
 //                 <TouchableOpacity
-//                   style={styles.viewerButton}
-//                   onPress={deleteCurrentPhoto}
+//                   onPress={handleBatchFavoriteToggle}
+//                   style={styles.multiSelectButton}
 //                 >
-//                   <Icon name="trash-outline" size={22} color="#FF6347" />
+//                   <Icon name="heart" size={22} color={theme.shared.red} />
 //                 </TouchableOpacity>
 //                 <TouchableOpacity
-//                   style={styles.viewerButton}
-//                   onPress={() => setShowComments(v => !v)}
+//                   onPress={handleBatchDelete}
+//                   style={styles.multiSelectButton}
+//                 >
+//                   <Icon name="trash" size={22} color={theme.shared.red} />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   onPress={handleSelectAll}
+//                   style={styles.multiSelectButton}
 //                 >
 //                   <Icon
-//                     name="chatbubble-ellipses-outline"
+//                     name="checkmark-done"
 //                     size={22}
-//                     color="#fff"
+//                     color={theme.shared.green}
 //                   />
+//                 </TouchableOpacity>
+//                 <TouchableOpacity
+//                   onPress={() => {
+//                     setMultiSelect(false);
+//                     setSelectedIds([]);
+//                   }}
+//                   style={styles.multiSelectButton}
+//                 >
+//                   <Icon name="close-circle" size={22} color={theme.gray.dark} />
 //                 </TouchableOpacity>
 //               </View>
-//               {showComments && (
-//                 <CommentsSection
-//                   imageId={img.id}
-//                   userId={userId}
-//                   theme={theme}
-//                 />
-//               )}
-//             </View>
-//           );
-//         }}
-//       />
+//             </LinearGradient>
+//           </Animated.View>
+//         )}
 
-//       {/* Video Viewer (dedicated) */}
-//       <Modal
-//         isVisible={videoVisible}
-//         onBackdropPress={() => setVideoVisible(false)}
-//         onBackButtonPress={() => setVideoVisible(false)}
-//         style={{ margin: 0 }}
-//         useNativeDriver
-//         hideModalContentWhileAnimating
-//       >
-//         <View style={{ flex: 1, backgroundColor: '#000' }}>
-//           <Video
-//             source={{ uri: videoUri }}
-//             style={{ width: '100%', height: '100%' }}
-//             controls
-//             paused={false}
-//             resizeMode="contain"
-//             onError={e => log('Video error:', e)}
-//             onLoad={meta => log('Video loaded duration:', meta.duration)}
-//             posterResizeMode="cover"
-//           />
-//           <TouchableOpacity
-//             onPress={() => setVideoVisible(false)}
-//             style={{
-//               position: 'absolute',
-//               top: 20,
-//               right: 20,
-//               backgroundColor: 'rgba(0,0,0,0.5)',
-//               padding: 8,
-//               borderRadius: 18,
-//             }}
+//         {/* Search + Filter + toggle */}
+//         <Animated.View
+//           style={[
+//             styles.searchBar,
+//             {
+//               opacity: fadeAnim,
+//               transform: [{ scale: scaleAnim }],
+//             },
+//           ]}
+//         >
+//           <LinearGradient
+//             colors={['#FFFFFF', theme.colors.ultraLight]}
+//             style={styles.searchGradient}
 //           >
-//             <Icon name="close" size={22} color="#fff" />
-//           </TouchableOpacity>
-//         </View>
-//       </Modal>
+//             <Icon name="search" size={20} color={theme.colors.primary} />
+//             <TextInput
+//               style={[styles.searchInput, { color: theme.text }]}
+//               placeholder="Search memories..."
+//               placeholderTextColor={theme.gray.medium}
+//               value={search}
+//               onChangeText={t => {
+//                 setSearch(t);
+//                 log('Search changed:', t);
+//               }}
+//             />
+//             <TouchableOpacity
+//               onPress={() => setShowFilterDropdown(v => !v)}
+//               style={styles.filterButton}
+//             >
+//               <LinearGradient
+//                 colors={theme.gradient}
+//                 style={styles.filterGradient}
+//               >
+//                 <Icon name="options" size={20} color="#FFFFFF" />
+//               </LinearGradient>
+//             </TouchableOpacity>
+//             <TouchableOpacity
+//               onPress={() => setMultiSelect(v => !v)}
+//               style={styles.selectButton}
+//             >
+//               <Icon
+//                 name={multiSelect ? 'checkbox' : 'checkbox-outline'}
+//                 size={24}
+//                 color={theme.colors.primary}
+//               />
+//             </TouchableOpacity>
+//           </LinearGradient>
+//         </Animated.View>
 
-//       {/* Error & Success */}
-//       <ErrorModal
-//         visible={errorModal.visible}
-//         message={errorModal.message}
-//         onClose={() => setErrorModal({ visible: false, message: '' })}
-//         theme={theme}
-//       />
-//       <ErrorModal
-//         visible={successModal.visible}
-//         message={successModal.message}
-//         onClose={() => setSuccessModal({ visible: false, message: '' })}
-//         theme={theme}
-//       />
-//     </SafeAreaView>
+//         {/* Filter Dropdown */}
+//         {showFilterDropdown && (
+//           <Animated.View
+//             style={[
+//               styles.dropdown,
+//               {
+//                 opacity: fadeAnim,
+//                 transform: [{ scale: scaleAnim }],
+//               },
+//             ]}
+//           >
+//             {FILTERS.map(f => (
+//               <TouchableOpacity
+//                 key={f.value}
+//                 style={[
+//                   styles.dropdownItem,
+//                   filter === f.value && styles.dropdownItemActive,
+//                 ]}
+//                 onPress={() => {
+//                   setFilter(f.value);
+//                   setShowFilterDropdown(false);
+//                   log('Filter set to:', f.value);
+//                 }}
+//               >
+//                 <Icon
+//                   name={f.icon}
+//                   size={18}
+//                   color={filter === f.value ? f.color : theme.gray.dark}
+//                 />
+//                 <Text
+//                   style={[
+//                     styles.dropdownText,
+//                     {
+//                       color: filter === f.value ? f.color : theme.gray.dark,
+//                       fontWeight: filter === f.value ? 'bold' : 'normal',
+//                     },
+//                   ]}
+//                 >
+//                   {f.label}
+//                 </Text>
+//               </TouchableOpacity>
+//             ))}
+//           </Animated.View>
+//         )}
+
+//         {/* Sections */}
+//         <ScrollView
+//           contentContainerStyle={{ paddingBottom: 120 }}
+//           refreshControl={
+//             <RefreshControl
+//               refreshing={refreshing}
+//               onRefresh={onRefresh}
+//               tintColor={theme.colors.primary}
+//               colors={[theme.colors.primary]}
+//             />
+//           }
+//           showsVerticalScrollIndicator={false}
+//         >
+//           {Object.keys(groupedImages).map(date =>
+//             renderSection(date, groupedImages[date]),
+//           )}
+//         </ScrollView>
+
+//         {/* Upload FAB */}
+//         <TouchableOpacity
+//           style={styles.fab}
+//           onPress={handleImagePickAndUpload}
+//           activeOpacity={0.8}
+//         >
+//           <LinearGradient colors={theme.gradient} style={styles.fabGradient}>
+//             <Icon name="add" size={32} color="#FFFFFF" />
+//           </LinearGradient>
+//         </TouchableOpacity>
+
+//         {/* Upload Progress */}
+//         {uploading && (
+//           <Animated.View
+//             style={[
+//               styles.uploadStatus,
+//               {
+//                 opacity: fadeAnim,
+//               },
+//             ]}
+//           >
+//             <LinearGradient
+//               colors={[
+//                 theme.colors.primary + 'DD',
+//                 theme.colors.secondary + 'DD',
+//               ]}
+//               style={styles.uploadGradient}
+//             >
+//               <ActivityIndicator color="white" />
+//               <Text style={styles.uploadText}>Uploading... {progress}%</Text>
+//             </LinearGradient>
+//           </Animated.View>
+//         )}
+
+//         {/* Photo Viewer */}
+//         <ImageViewing
+//           images={photosOnly.map(img => ({ uri: img.image_url }))}
+//           imageIndex={photoViewerIndex}
+//           visible={isViewerVisible}
+//           onRequestClose={() => setIsViewerVisible(false)}
+//           doubleTapToZoomEnabled
+//           swipeToCloseEnabled
+//           onImageIndexChange={() => {
+//             setShowFooter(true);
+//             setShowComments(false);
+//           }}
+//           imageContainerStyle={{ marginBottom: showFooter ? 180 : 0 }}
+//           FooterComponent={() => {
+//             const img = photosOnly[photoViewerIndex];
+//             if (!img) return null;
+//             return (
+//               <View>
+//                 <LinearGradient
+//                   colors={['transparent', 'rgba(0,0,0,0.8)']}
+//                   style={styles.viewerFooter}
+//                 >
+//                   <TouchableOpacity
+//                     style={styles.viewerButton}
+//                     onPress={handleShareCurrent}
+//                   >
+//                     <Icon name="share-social" size={24} color="#FFFFFF" />
+//                   </TouchableOpacity>
+//                   <TouchableOpacity
+//                     style={styles.viewerButton}
+//                     onPress={handleSaveCurrent}
+//                   >
+//                     <Icon name="download" size={24} color="#FFFFFF" />
+//                   </TouchableOpacity>
+//                   <TouchableOpacity
+//                     style={styles.viewerButton}
+//                     onPress={toggleFavoriteCurrent}
+//                   >
+//                     <Icon
+//                       name={img.favorite ? 'heart' : 'heart-outline'}
+//                       size={24}
+//                       color={theme.shared.red}
+//                     />
+//                   </TouchableOpacity>
+//                   <TouchableOpacity
+//                     style={styles.viewerButton}
+//                     onPress={deleteCurrentPhoto}
+//                   >
+//                     <Icon name="trash" size={24} color={theme.shared.red} />
+//                   </TouchableOpacity>
+//                   <TouchableOpacity
+//                     style={styles.viewerButton}
+//                     onPress={() => setShowComments(v => !v)}
+//                   >
+//                     <Icon
+//                       name="chatbubble-ellipses"
+//                       size={24}
+//                       color="#FFFFFF"
+//                     />
+//                   </TouchableOpacity>
+//                 </LinearGradient>
+//                 {showComments && (
+//                   <CommentsSection
+//                     imageId={img.id}
+//                     userId={userId}
+//                     theme={theme}
+//                   />
+//                 )}
+//               </View>
+//             );
+//           }}
+//         />
+
+//         {/* Video Viewer (dedicated) */}
+//         <Modal
+//           isVisible={videoVisible}
+//           onBackdropPress={() => setVideoVisible(false)}
+//           onBackButtonPress={() => setVideoVisible(false)}
+//           style={{ margin: 0 }}
+//           useNativeDriver
+//           hideModalContentWhileAnimating
+//         >
+//           <View style={{ flex: 1, backgroundColor: '#000' }}>
+//             <Video
+//               source={{ uri: videoUri }}
+//               style={{ width: '100%', height: '100%' }}
+//               controls
+//               paused={false}
+//               resizeMode="contain"
+//               onError={e => log('Video error:', e)}
+//               onLoad={meta => log('Video loaded duration:', meta.duration)}
+//               posterResizeMode="cover"
+//             />
+//             <TouchableOpacity
+//               onPress={() => setVideoVisible(false)}
+//               style={styles.videoCloseButton}
+//             >
+//               <LinearGradient
+//                 colors={['rgba(0,0,0,0.5)', 'rgba(0,0,0,0.8)']}
+//                 style={styles.videoCloseGradient}
+//               >
+//                 <Icon name="close" size={24} color="#FFFFFF" />
+//               </LinearGradient>
+//             </TouchableOpacity>
+//           </View>
+//         </Modal>
+
+//         {/* Error & Success */}
+//         <ErrorModal
+//           visible={errorModal.visible}
+//           message={errorModal.message}
+//           onClose={() => setErrorModal({ visible: false, message: '' })}
+//           theme={theme}
+//         />
+//         <ErrorModal
+//           visible={successModal.visible}
+//           message={successModal.message}
+//           onClose={() => setSuccessModal({ visible: false, message: '' })}
+//           theme={theme}
+//         />
+//       </SafeAreaView>
+//     </LinearGradient>
 //   );
 // };
 
-// // Styles — exactly like your previous file (you said you'll keep them as-is)
+// // Enhanced Styles
 // const styles = StyleSheet.create({
-//   container: { flex: 1, padding: 16 },
+//   container: { flex: 1 },
 //   loader: {
 //     flex: 1,
 //     justifyContent: 'center',
 //     alignItems: 'center',
-//     backgroundColor: '#FFF0F6',
+//   },
+//   loadingText: {
+//     color: '#FFFFFF',
+//     fontSize: 18,
+//     marginTop: 16,
+//     fontWeight: '600',
 //   },
 
 //   header: {
 //     flexDirection: 'row',
 //     alignItems: 'center',
-//     marginBottom: 10,
+//     paddingHorizontal: 16,
+//     paddingVertical: 12,
 //     justifyContent: 'space-between',
 //   },
+//   avatarContainer: {
+//     marginRight: 12,
+//   },
+//   avatarGradient: {
+//     width: 44,
+//     height: 44,
+//     borderRadius: 22,
+//     padding: 2,
+//     elevation: 4,
+//     shadowColor: '#000',
+//     shadowOpacity: 0.2,
+//     shadowRadius: 4,
+//     shadowOffset: { width: 0, height: 2 },
+//   },
 //   avatar: {
+//     width: 40,
+//     height: 40,
+//     borderRadius: 20,
+//     backgroundColor: '#FFF',
+//   },
+//   headerTitleContainer: {
+//     flex: 1,
+//     paddingVertical: 8,
+//     paddingHorizontal: 16,
+//     borderRadius: 20,
+//     marginRight: 12,
+//   },
+//   headerTitle: {
+//     fontSize: 20,
+//     fontWeight: 'bold',
+//     color: '#FFFFFF',
+//     textAlign: 'center',
+//   },
+//   menuTrigger: {
+//     padding: 8,
+//     borderRadius: 20,
+//     backgroundColor: 'rgba(255,255,255,0.9)',
+//     elevation: 2,
+//   },
+//   menuOptionContainer: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     padding: 12,
+//   },
+//   menuOption: {
+//     fontSize: 16,
+//     marginLeft: 12,
+//     color: '#222',
+//     fontWeight: '500',
+//   },
+
+//   searchBar: {
+//     marginHorizontal: 16,
+//     marginBottom: 12,
+//   },
+//   searchGradient: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     borderRadius: 25,
+//     paddingHorizontal: 16,
+//     paddingVertical: 12,
+//     elevation: 4,
+//     shadowColor: '#000',
+//     shadowOpacity: 0.1,
+//     shadowRadius: 4,
+//     shadowOffset: { width: 0, height: 2 },
+//   },
+//   searchInput: {
+//     flex: 1,
+//     marginLeft: 12,
+//     fontSize: 16,
+//   },
+//   filterButton: {
+//     marginLeft: 8,
+//   },
+//   filterGradient: {
 //     width: 36,
 //     height: 36,
 //     borderRadius: 18,
-//     marginRight: 10,
-//     borderWidth: 2,
-//     borderColor: '#fff',
-//     backgroundColor: '#eee',
-//   },
-//   headerTitle: {
-//     fontSize: 22,
-//     fontWeight: 'bold',
-//     color: '#FF80AB',
-//     textAlign: 'left',
-//     flex: 1,
-//   },
-//   menuOption: { fontSize: 16, padding: 10, color: '#222' },
-
-//   searchBar: {
-//     flexDirection: 'row',
+//     justifyContent: 'center',
 //     alignItems: 'center',
-//     backgroundColor: '#fff',
-//     borderRadius: 20,
-//     padding: 10,
-//     marginBottom: 10,
-//     elevation: 2,
 //   },
-//   searchInput: { flex: 1, marginLeft: 10, color: '#333' },
+//   selectButton: {
+//     marginLeft: 12,
+//   },
 
-//   section: { marginBottom: 24 },
+//   section: {
+//     marginBottom: 24,
+//     marginHorizontal: 16,
+//   },
+//   sectionHeaderGradient: {
+//     borderRadius: 12,
+//     marginBottom: 12,
+//   },
 //   sectionHeader: {
 //     flexDirection: 'row',
 //     justifyContent: 'space-between',
 //     alignItems: 'center',
-//     marginBottom: 8,
+//     paddingVertical: 8,
+//     paddingHorizontal: 12,
 //   },
-//   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#222' },
-//   seeAll: { color: '#FF6347', fontWeight: 'bold' },
+//   sectionTitle: {
+//     fontSize: 18,
+//     fontWeight: 'bold',
+//   },
+//   seeAllButton: {
+//     borderRadius: 16,
+//   },
+//   seeAllGradient: {
+//     paddingHorizontal: 16,
+//     paddingVertical: 6,
+//     borderRadius: 16,
+//   },
+//   seeAll: {
+//     color: '#FFFFFF',
+//     fontWeight: 'bold',
+//     fontSize: 14,
+//   },
 
 //   fab: {
 //     position: 'absolute',
-//     right: 30,
+//     right: 24,
 //     bottom: 100,
-//     backgroundColor: '#FF80AB',
-//     borderRadius: 30,
-//     width: 60,
-//     height: 60,
+//     zIndex: 10,
+//   },
+//   fabGradient: {
+//     width: 64,
+//     height: 64,
+//     borderRadius: 32,
 //     justifyContent: 'center',
 //     alignItems: 'center',
 //     elevation: 8,
 //     shadowColor: '#000',
-//     shadowOpacity: 0.2,
+//     shadowOpacity: 0.3,
 //     shadowRadius: 8,
 //     shadowOffset: { width: 0, height: 4 },
-//     zIndex: 10,
 //   },
+
 //   uploadStatus: {
 //     position: 'absolute',
-//     bottom: 100,
+//     bottom: 160,
 //     alignSelf: 'center',
-//     backgroundColor: 'rgba(0,0,0,0.7)',
-//     paddingVertical: 10,
-//     paddingHorizontal: 20,
-//     borderRadius: 20,
-//     flexDirection: 'row',
-//     alignItems: 'center',
 //     zIndex: 10,
 //   },
-//   uploadText: { marginLeft: 10, fontSize: 16, color: 'white' },
-
-//   multiSelectBar: {
+//   uploadGradient: {
+//     paddingVertical: 12,
+//     paddingHorizontal: 24,
+//     borderRadius: 25,
 //     flexDirection: 'row',
 //     alignItems: 'center',
-//     backgroundColor: '#fff',
-//     borderRadius: 16,
-//     padding: 8,
-//     marginBottom: 8,
-//     marginHorizontal: 4,
-//     elevation: 2,
-//     justifyContent: 'space-between',
+//   },
+//   uploadText: {
+//     marginLeft: 12,
+//     fontSize: 16,
+//     color: 'white',
+//     fontWeight: '600',
 //   },
 
-//   // Viewer footer
+//   multiSelectBar: {
+//     marginHorizontal: 16,
+//     marginBottom: 12,
+//   },
+//   multiSelectGradient: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     borderRadius: 20,
+//     padding: 12,
+//     justifyContent: 'space-between',
+//     elevation: 2,
+//   },
+//   selectedText: {
+//     fontWeight: 'bold',
+//     fontSize: 16,
+//   },
+//   multiSelectActions: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//   },
+//   multiSelectButton: {
+//     padding: 8,
+//     marginHorizontal: 4,
+//     backgroundColor: 'rgba(255,255,255,0.8)',
+//     borderRadius: 20,
+//   },
+
 //   viewerFooter: {
 //     flexDirection: 'row',
 //     justifyContent: 'center',
 //     alignItems: 'center',
-//     marginBottom: 24,
-//     width: '100%',
+//     paddingVertical: 20,
+//     paddingHorizontal: 16,
 //     position: 'absolute',
 //     bottom: 0,
+//     width: '100%',
 //   },
 //   viewerButton: {
-//     backgroundColor: 'rgba(0,0,0,0.6)',
-//     paddingVertical: 10,
-//     paddingHorizontal: 10,
-//     borderRadius: 8,
-//     marginHorizontal: 2,
-//     flexDirection: 'row',
-//     alignItems: 'center',
-//     minWidth: 44,
+//     backgroundColor: 'rgba(255,255,255,0.2)',
+//     paddingVertical: 12,
+//     paddingHorizontal: 16,
+//     borderRadius: 25,
+//     marginHorizontal: 4,
+//     backdropFilter: 'blur(10px)',
 //   },
 
 //   dropdown: {
 //     position: 'absolute',
-//     top: 110,
+//     top: 140,
 //     right: 16,
 //     zIndex: 10,
-//     backgroundColor: '#fff',
-//     borderRadius: 12,
+//     backgroundColor: '#FFFFFF',
+//     borderRadius: 16,
 //     elevation: 8,
 //     shadowColor: '#000',
-//     shadowOpacity: 0.1,
+//     shadowOpacity: 0.15,
 //     shadowRadius: 8,
 //     shadowOffset: { width: 0, height: 4 },
-//     minWidth: 140,
+//     minWidth: 180,
+//     padding: 8,
 //   },
 //   dropdownItem: {
-//     padding: 14,
-//     borderBottomWidth: 0.5,
-//     borderBottomColor: '#eee',
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     padding: 12,
+//     borderRadius: 12,
+//     marginVertical: 2,
+//   },
+//   dropdownItemActive: {
+//     backgroundColor: 'rgba(102, 126, 234, 0.1)',
+//   },
+//   dropdownText: {
+//     marginLeft: 12,
+//     fontSize: 15,
+//   },
+
+//   videoCloseButton: {
+//     position: 'absolute',
+//     top: 40,
+//     right: 20,
+//   },
+//   videoCloseGradient: {
+//     width: 40,
+//     height: 40,
+//     borderRadius: 20,
+//     justifyContent: 'center',
+//     alignItems: 'center',
 //   },
 // });
+
+// const menuOptionsStyles = {
+//   optionsContainer: {
+//     backgroundColor: 'white',
+//     borderRadius: 16,
+//     padding: 8,
+//     elevation: 8,
+//     shadowColor: '#000',
+//     shadowOpacity: 0.15,
+//     shadowRadius: 8,
+//     shadowOffset: { width: 0, height: 4 },
+//     marginTop: 40,
+//     marginRight: 16,
+//   },
+// };
 
 // export default GalleryScreen;

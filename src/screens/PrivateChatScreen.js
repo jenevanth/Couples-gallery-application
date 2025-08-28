@@ -1,3 +1,4 @@
+// src/screens/PrivateChatScreen.js
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
@@ -9,6 +10,7 @@ import {
   Platform,
   ActivityIndicator,
   Keyboard,
+  Alert,
 } from 'react-native';
 import {
   SafeAreaView,
@@ -33,7 +35,7 @@ const MIN_COMPOSER = 42;
 const MAX_COMPOSER = 140;
 
 const PrivateChatScreen = ({ navigation }) => {
-  const { theme } = useTheme(); // theme.colors.primary & .light
+  const { theme } = useTheme();
   const insets = useSafeAreaInsets();
 
   const [messages, setMessages] = useState([]);
@@ -104,6 +106,7 @@ const PrivateChatScreen = ({ navigation }) => {
   useEffect(() => {
     const init = async () => {
       try {
+        log('Init -> fetching auth user...');
         const {
           data: { user },
           error,
@@ -117,7 +120,7 @@ const PrivateChatScreen = ({ navigation }) => {
         setUserId(user.id);
         log('Auth user id:', user.id);
 
-        // Get household_id (and current_profile if you want local UI hints)
+        log('Fetching profile for household_id...');
         const { data: prof, error: pErr } = await supabase
           .from('profiles')
           .select('household_id, current_profile')
@@ -144,7 +147,13 @@ const PrivateChatScreen = ({ navigation }) => {
   // Fetch + realtime scoped to household
   useFocusEffect(
     useCallback(() => {
-      if (!userId || !householdId) return;
+      if (!userId || !householdId) {
+        log('Realtime subscribe skipped: missing userId/householdId', {
+          userId,
+          householdId,
+        });
+        return;
+      }
 
       let isMounted = true;
       setLoading(true);
@@ -167,6 +176,7 @@ const PrivateChatScreen = ({ navigation }) => {
       };
       fetchMessages();
 
+      log('Subscribing realtime channel:', `messages-household-${householdId}`);
       const channel = supabase
         .channel(`messages-household-${householdId}`)
         .on(
@@ -197,6 +207,65 @@ const PrivateChatScreen = ({ navigation }) => {
     }, [userId, householdId, addIfNotPresent]),
   );
 
+  // Invoke edge function to push notifications for a message
+  const notifyForMessage = async (messageId, debugNotifySelf = false) => {
+    try {
+      log(
+        'Invoking push-new-message for message_id:',
+        messageId,
+        'debug:',
+        debugNotifySelf,
+      );
+      const tStart = Date.now();
+      const { data: fnRes, error: fnErr } = await supabase.functions.invoke(
+        'push-new-message',
+        { body: { message_id: messageId, debug_notify_self: debugNotifySelf } },
+      );
+      const ms = Date.now() - tStart;
+      log('push-new-message response:', fnRes, fnErr, 'ms:', ms);
+      if (fnRes?.fcmResults) {
+        log('FCM Results:', JSON.stringify(fnRes.fcmResults, null, 2));
+      }
+      if (fnErr) {
+        Alert.alert('Push Error', fnErr.message || 'Edge function error');
+      }
+    } catch (e) {
+      log('push-new-message invoke exception:', e);
+      Alert.alert('Push Exception', e?.message || String(e));
+    }
+  };
+
+  // Debug: send push for the latest message in this household (notify myself)
+  const debugSendPushForLatestMessage = async () => {
+    try {
+      if (!householdId) {
+        Alert.alert('Debug Push', 'No household found.');
+        return;
+      }
+      log('[Debug] Fetching latest message for household:', householdId);
+      const { data, error } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('household_id', householdId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (error) {
+        log('[Debug] latest message fetch error:', error);
+        Alert.alert('Debug Push', error.message);
+        return;
+      }
+      const mid = data?.[0]?.id;
+      if (!mid) {
+        Alert.alert('Debug Push', 'No messages yet.');
+        return;
+      }
+      await notifyForMessage(mid, true);
+    } catch (e) {
+      log('[Debug] exception:', e);
+      Alert.alert('Debug Push', e?.message || String(e));
+    }
+  };
+
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed) {
@@ -204,7 +273,7 @@ const PrivateChatScreen = ({ navigation }) => {
       return;
     }
     if (!userId || !householdId) {
-      log('Send aborted: missing userId/householdId');
+      log('Send aborted: missing userId/householdId', { userId, householdId });
       return;
     }
 
@@ -223,10 +292,10 @@ const PrivateChatScreen = ({ navigation }) => {
     setInput('');
     setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
 
-    // Insert (policies + trigger will ensure household_id & sender_id are correct)
+    // Insert
     const { data, error } = await supabase
       .from('messages')
-      .insert({ text: trimmed, household_id: householdId, sender_id: userId }) // household_id optional if trigger is set
+      .insert({ text: trimmed, household_id: householdId, sender_id: userId })
       .select()
       .single();
 
@@ -234,11 +303,15 @@ const PrivateChatScreen = ({ navigation }) => {
       log('Insert error:', error);
       // Rollback optimistic
       setMessages(prev => prev.filter(m => m.id !== tempId));
+      Alert.alert('Message Error', error.message || 'Failed to send');
       return;
     }
 
     log('Insert success:', data);
     upsertMessage(data, tempId);
+
+    // Push notify others (exclude me)
+    await notifyForMessage(data.id, false);
   };
 
   // Group with date separators
@@ -358,8 +431,16 @@ const PrivateChatScreen = ({ navigation }) => {
         >
           <Icon name="arrow-back" size={26} color="#fff" />
         </TouchableOpacity>
+
         <Text style={styles.headerTitle}>I love you</Text>
-        <View style={{ width: 32 }} />
+
+        {/* Debug push test */}
+        <TouchableOpacity
+          onPress={debugSendPushForLatestMessage}
+          style={styles.backButton}
+        >
+          <Icon name="notifications" size={22} color="#fff" />
+        </TouchableOpacity>
       </View>
 
       <View style={{ flex: 1 }}>
@@ -575,21 +656,22 @@ export default PrivateChatScreen;
 // const MAX_COMPOSER = 140;
 
 // const PrivateChatScreen = ({ navigation }) => {
-//   const { theme } = useTheme();
+//   const { theme } = useTheme(); // theme.colors.primary & .light
 //   const insets = useSafeAreaInsets();
 
 //   const [messages, setMessages] = useState([]);
 //   const [input, setInput] = useState('');
 //   const [composerHeight, setComposerHeight] = useState(MIN_COMPOSER);
-//   const [profile, setProfile] = useState('me'); // 'me' or 'her'
+
 //   const [userId, setUserId] = useState(null);
+//   const [householdId, setHouseholdId] = useState(null);
 //   const [loading, setLoading] = useState(true);
 
 //   const [keyboardHeight, setKeyboardHeight] = useState(0);
-//   const [inputBarHeight, setInputBarHeight] = useState(56); // measured
+//   const [inputBarHeight, setInputBarHeight] = useState(56);
 //   const flatListRef = useRef();
 
-//   // Util: upsert message by id (prevents duplicates)
+//   // Helpers for dedupe/merge
 //   const upsertMessage = useCallback((msg, replaceId = null) => {
 //     setMessages(prev => {
 //       const base = replaceId ? prev.filter(m => m.id !== replaceId) : prev;
@@ -603,18 +685,16 @@ export default PrivateChatScreen;
 //     });
 //   }, []);
 
-//   // Util: add only if not present (for realtime merges)
 //   const addIfNotPresent = useCallback(msg => {
 //     setMessages(prev => {
 //       const exists = prev.some(m => m.id === msg.id);
-//       if (exists) {
+//       if (exists)
 //         return prev.map(m => (m.id === msg.id ? { ...m, ...msg } : m));
-//       }
 //       return [...prev, msg];
 //     });
 //   }, []);
 
-//   // Keyboard listeners (for Android we move the input bar; iOS uses safe area)
+//   // Keyboard listeners
 //   useEffect(() => {
 //     const showEvt =
 //       Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
@@ -625,7 +705,6 @@ export default PrivateChatScreen;
 //       const kh = e?.endCoordinates?.height || 0;
 //       setKeyboardHeight(kh);
 //       log('Keyboard show height:', kh);
-//       // Auto scroll when keyboard opens
 //       setTimeout(
 //         () => flatListRef.current?.scrollToEnd({ animated: true }),
 //         50,
@@ -644,47 +723,61 @@ export default PrivateChatScreen;
 //     };
 //   }, []);
 
-//   // Load auth user + profile selection
+//   // Load user + household_id
 //   useEffect(() => {
 //     const init = async () => {
-//       const { data: { user } = {}, error } = await supabase.auth.getUser();
-//       if (error) log('auth.getUser error:', error);
-//       if (!user) {
-//         log('No auth user');
+//       try {
+//         const {
+//           data: { user },
+//           error,
+//         } = await supabase.auth.getUser();
+//         if (error) log('auth.getUser error:', error);
+//         if (!user) {
+//           log('No auth user');
+//           setLoading(false);
+//           return;
+//         }
+//         setUserId(user.id);
+//         log('Auth user id:', user.id);
+
+//         // Get household_id (and current_profile if you want local UI hints)
+//         const { data: prof, error: pErr } = await supabase
+//           .from('profiles')
+//           .select('household_id, current_profile')
+//           .eq('id', user.id)
+//           .single();
+
+//         if (pErr) log('profiles fetch error:', pErr);
+//         setHouseholdId(prof?.household_id || null);
+//         log(
+//           'Loaded household_id:',
+//           prof?.household_id,
+//           'profile:',
+//           prof?.current_profile,
+//         );
+//       } catch (e) {
+//         log('init exception:', e);
+//       } finally {
 //         setLoading(false);
-//         return;
 //       }
-//       setUserId(user.id);
-//       log('Auth user id:', user.id);
-
-//       const { data: prof, error: pErr } = await supabase
-//         .from('profiles')
-//         .select('current_profile')
-//         .eq('id', user.id)
-//         .single();
-
-//       if (pErr) log('profiles fetch error:', pErr);
-//       setProfile(prof?.current_profile || 'me');
-//       log('Loaded profile current_profile:', prof?.current_profile);
-//       setLoading(false);
 //     };
 //     init();
 //   }, []);
 
-//   // Fetch + realtime scoped to user
+//   // Fetch + realtime scoped to household
 //   useFocusEffect(
 //     useCallback(() => {
-//       if (!userId) return;
+//       if (!userId || !householdId) return;
 
 //       let isMounted = true;
 //       setLoading(true);
 
 //       const fetchMessages = async () => {
-//         log('Fetching messages for user:', userId);
+//         log('Fetching messages for household:', householdId);
 //         const { data, error } = await supabase
 //           .from('messages')
 //           .select('*')
-//           .eq('user_id', userId)
+//           .eq('household_id', householdId)
 //           .order('created_at', { ascending: true });
 
 //         if (error) log('Fetch error:', error);
@@ -698,14 +791,14 @@ export default PrivateChatScreen;
 //       fetchMessages();
 
 //       const channel = supabase
-//         .channel(`messages-user-${userId}`)
+//         .channel(`messages-household-${householdId}`)
 //         .on(
 //           'postgres_changes',
 //           {
 //             event: '*',
 //             schema: 'public',
 //             table: 'messages',
-//             filter: `user_id=eq.${userId}`,
+//             filter: `household_id=eq.${householdId}`,
 //           },
 //           payload => {
 //             log('Realtime payload:', payload.eventType, payload.new);
@@ -722,9 +815,9 @@ export default PrivateChatScreen;
 
 //       return () => {
 //         supabase.removeChannel(channel);
-//         log('Unsubscribed channel for user:', userId);
+//         log('Unsubscribed channel for household:', householdId);
 //       };
-//     }, [userId, addIfNotPresent]),
+//     }, [userId, householdId, addIfNotPresent]),
 //   );
 
 //   const handleSend = async () => {
@@ -733,20 +826,19 @@ export default PrivateChatScreen;
 //       log('Send aborted: empty input');
 //       return;
 //     }
-//     if (!userId) {
-//       log('Send aborted: no userId');
+//     if (!userId || !householdId) {
+//       log('Send aborted: missing userId/householdId');
 //       return;
 //     }
 
-//     log('Sending message:', { userId, profile, text: trimmed });
+//     log('Sending message:', { userId, householdId, text: trimmed });
 
 //     // Optimistic UI
 //     const tempId = `temp-${Date.now()}`;
 //     const optimistic = {
 //       id: tempId,
-//       sender: profile, // UI hint for schemas without sender column
-//       sender_id: userId, // fallback for schemas that only have sender_id
-//       user_id: userId,
+//       sender_id: userId,
+//       household_id: householdId,
 //       text: trimmed,
 //       created_at: new Date().toISOString(),
 //     };
@@ -754,37 +846,22 @@ export default PrivateChatScreen;
 //     setInput('');
 //     setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
 
-//     // Try insert with 'sender' first; fallback to 'sender_id'
-//     const trySender = await supabase
+//     // Insert (policies + trigger will ensure household_id & sender_id are correct)
+//     const { data, error } = await supabase
 //       .from('messages')
-//       .insert({ user_id: userId, sender: profile, text: trimmed })
+//       .insert({ text: trimmed, household_id: householdId, sender_id: userId }) // household_id optional if trigger is set
 //       .select()
 //       .single();
 
-//     if (!trySender.error && trySender.data) {
-//       log('Insert success (sender):', trySender.data);
-//       upsertMessage(trySender.data, tempId);
-//       return;
-//     }
-
-//     log('Insert error (sender). Trying sender_id fallback:', trySender.error);
-//     const fallback = await supabase
-//       .from('messages')
-//       .insert({ user_id: userId, sender_id: userId, text: trimmed })
-//       .select()
-//       .single();
-
-//     if (fallback.error) {
-//       log('Insert error (sender_id):', fallback.error);
+//     if (error) {
+//       log('Insert error:', error);
 //       // Rollback optimistic
 //       setMessages(prev => prev.filter(m => m.id !== tempId));
 //       return;
 //     }
 
-//     const saved = { ...fallback.data };
-//     if (!saved.sender) saved.sender = saved.sender_id === userId ? 'me' : 'her';
-//     log('Insert success (sender_id fallback):', saved);
-//     upsertMessage(saved, tempId);
+//     log('Insert success:', data);
+//     upsertMessage(data, tempId);
 //   };
 
 //   // Group with date separators
@@ -811,20 +888,12 @@ export default PrivateChatScreen;
 //         </View>
 //       );
 //     }
-//     const isMe = item.sender
-//       ? item.sender === profile
-//       : item.sender_id
-//       ? item.sender_id === userId
-//       : false;
+//     const isMe = item.sender_id === userId;
 
-//     const myBubble =
-//       profile === 'me'
-//         ? { backgroundColor: '#4FC3F7' }
-//         : { backgroundColor: '#FF80AB' };
-//     const partnerBubble =
-//       profile === 'me'
-//         ? { backgroundColor: '#ffe3f2' }
-//         : { backgroundColor: '#e3f2fd' };
+//     const myBubble = { backgroundColor: theme.colors.primary };
+//     const partnerBubble = {
+//       backgroundColor: theme.name === 'pink' ? '#ffe3f2' : '#e3f2fd',
+//     };
 
 //     return (
 //       <View
@@ -868,11 +937,11 @@ export default PrivateChatScreen;
 //     );
 //   };
 
-//   // Computed layout offsets
+//   // Layout offsets
 //   const androidKbOffset = Platform.OS === 'android' ? keyboardHeight : 0;
 //   const inputBottom =
-//     Platform.OS === 'android' ? androidKbOffset : insets.bottom; // iOS sits on safe area
-//   const listBottomPadding = inputBarHeight + androidKbOffset + 16; // ensures last message visible
+//     Platform.OS === 'android' ? androidKbOffset : insets.bottom;
+//   const listBottomPadding = inputBarHeight + androidKbOffset + 16;
 
 //   useEffect(() => {
 //     log(
@@ -898,18 +967,12 @@ export default PrivateChatScreen;
 
 //   return (
 //     <SafeAreaView
-//       style={{
-//         flex: 1,
-//         backgroundColor: profile === 'me' ? '#e3f2fd' : '#ffe3f2',
-//       }}
+//       style={{ flex: 1, backgroundColor: theme.colors.light + '20' }}
 //       edges={['top', 'left', 'right']}
 //     >
 //       {/* Header */}
 //       <View
-//         style={[
-//           styles.header,
-//           { backgroundColor: profile === 'me' ? '#4FC3F7' : '#FF80AB' },
-//         ]}
+//         style={[styles.header, { backgroundColor: theme.colors.primary }]}
 //         onLayout={e => log('Header height:', e.nativeEvent.layout.height)}
 //       >
 //         <TouchableOpacity
@@ -945,14 +1008,14 @@ export default PrivateChatScreen;
 //           }
 //         />
 
-//         {/* Input bar (absolute, never overlaps keyboard) */}
+//         {/* Input bar */}
 //         <View
 //           style={[
 //             styles.inputBar,
 //             {
 //               backgroundColor: '#fff',
-//               borderColor: (profile === 'me' ? '#4FC3F7' : '#FF80AB') + '44',
-//               bottom: inputBottom + 8, // sits above keyboard/safe area
+//               borderColor: theme.colors.primary + '44',
+//               bottom: inputBottom + 8,
 //             },
 //           ]}
 //           onLayout={e => {
@@ -971,7 +1034,7 @@ export default PrivateChatScreen;
 //             style={[
 //               styles.input,
 //               {
-//                 color: profile === 'me' ? '#4FC3F7' : '#FF80AB',
+//                 color: theme.colors.primary,
 //                 minHeight: MIN_COMPOSER,
 //                 height: Math.min(MAX_COMPOSER, composerHeight),
 //               },
@@ -992,13 +1055,7 @@ export default PrivateChatScreen;
 //             <Icon
 //               name="send"
 //               size={24}
-//               color={
-//                 input.trim()
-//                   ? profile === 'me'
-//                     ? '#4FC3F7'
-//                     : '#FF80AB'
-//                   : '#ccc'
-//               }
+//               color={input.trim() ? theme.colors.primary : '#ccc'}
 //               style={{ marginHorizontal: 8 }}
 //             />
 //           </TouchableOpacity>
