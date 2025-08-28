@@ -26,6 +26,7 @@ import {
   PermissionsAndroid,
   ToastAndroid,
 } from 'react-native';
+import { Modal as RNModal } from 'react-native'; // NEW: blackout overlay modal (zero animation)
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
 import { supabase } from '../services/supabase';
@@ -38,7 +39,6 @@ import BlobUtil from 'react-native-blob-util';
 import Icon from 'react-native-vector-icons/Ionicons';
 import Modal from 'react-native-modal';
 import Video from 'react-native-video';
-import FastImage from 'react-native-fast-image'; // NEW: eliminate flash with FastImage
 import { format, parseISO, isToday, isSameMonth, isSameWeek } from 'date-fns';
 import {
   Menu,
@@ -139,9 +139,6 @@ const GalleryScreen = ({ navigation }) => {
     visible: false,
     message: '',
   });
-
-  // NEW: freeze viewer sources while modal is visible to avoid re-renders (which cause flicker)
-  const [viewerFrozenSources, setViewerFrozenSources] = useState([]);
 
   // Animations
   useEffect(() => {
@@ -355,34 +352,6 @@ const GalleryScreen = ({ navigation }) => {
       viewerItems.map(m =>
         m.type === 'video' ? { uri: TRANSPARENT_PNG } : { uri: m.image_url },
       ),
-    [viewerItems],
-  );
-
-  // NEW: prefetch current and neighbor images to avoid decode flashes
-  const prefetchNeighbors = useCallback(
-    idx => {
-      try {
-        const targets = [idx - 1, idx, idx + 1]
-          .filter(i => i >= 0 && i < viewerItems.length)
-          .map(i => viewerItems[i])
-          .filter(it => it?.type === 'photo')
-          .map(it => ({
-            uri: it.image_url,
-            priority: FastImage.priority.high,
-          }));
-        if (targets.length) {
-          FastImage.preload(targets);
-          log(
-            '[Viewer] Prefetched neighbors for index:',
-            idx,
-            'count:',
-            targets.length,
-          );
-        }
-      } catch (e) {
-        log('[Viewer] Prefetch error:', e);
-      }
-    },
     [viewerItems],
   );
 
@@ -682,11 +651,6 @@ const GalleryScreen = ({ navigation }) => {
       setIsViewerVisible(true);
       setShowReactions(false);
       setShowPhotoInfo(false);
-
-      // NEW: freeze sources and prefetch neighbors to avoid flicker
-      setViewerFrozenSources(viewerSources);
-      prefetchNeighbors(idx);
-
       log('Open viewer for id:', item.id, 'viewerIndex:', idx);
       return;
     }
@@ -756,7 +720,6 @@ const GalleryScreen = ({ navigation }) => {
             log('Delete error:', error);
           } else {
             setIsViewerVisible(false);
-            setViewerFrozenSources([]); // NEW: unfreeze when closing
             fetchImages();
             log('Deleted photo id:', item.id);
           }
@@ -1586,16 +1549,24 @@ const GalleryScreen = ({ navigation }) => {
           <View pointerEvents="none" style={styles.viewerBackdrop} />
         )}
 
+        {/* Blackout overlay under the viewer to prevent any flicker of the screen */}
+        <RNModal
+          visible={isViewerVisible}
+          transparent
+          statusBarTranslucent
+          animationType="none"
+          hardwareAccelerated
+        >
+          <View style={styles.blackCover} />
+        </RNModal>
+
         {/* Media Viewer (photos + video placeholders) */}
         <ImageViewing
-          images={
-            viewerFrozenSources.length ? viewerFrozenSources : viewerSources
-          } // NEW: frozen while open
+          images={viewerSources}
           imageIndex={viewerIndex}
           visible={isViewerVisible}
           onRequestClose={() => {
             setIsViewerVisible(false);
-            setViewerFrozenSources([]); // NEW: unfreeze on close
             if (slideshowActive) {
               stopSlideshowTimer('viewer-close');
               setSlideshowActive(false);
@@ -1610,25 +1581,8 @@ const GalleryScreen = ({ navigation }) => {
           swipeToCloseEnabled
           // Ensure the image areas are fully black (no transparency)
           imageContainerStyle={{ backgroundColor: '#000' }}
-          // NEW: render with FastImage and disable decode fade
-          ImageComponent={FastImage}
-          imageProps={{
-            fadeDuration: 0, // Android RN Image fade (harmless for FastImage)
-            resizeMode: FastImage.resizeMode.contain,
-            onLoadStart: () =>
-              log('[Viewer] image load start idx:', viewerIndex),
-            onLoad: () => log('[Viewer] image loaded idx:', viewerIndex),
-            onError: e =>
-              log(
-                '[Viewer] image load error idx:',
-                viewerIndex,
-                e?.nativeEvent || e,
-              ),
-          }}
           onImageIndexChange={idx => {
             setViewerIndex(idx);
-            prefetchNeighbors(idx); // NEW: keep next/prev ready
-
             // Smooth swipe: pause slideshow during swipe and resume shortly after
             if (slideshowActive) {
               pausedByUserSwipeRef.current = true;
@@ -1657,7 +1611,6 @@ const GalleryScreen = ({ navigation }) => {
                 <TouchableOpacity
                   onPress={() => {
                     setIsViewerVisible(false);
-                    setViewerFrozenSources([]); // NEW: unfreeze on close button
                     if (slideshowActive) {
                       stopSlideshowTimer('viewer-close-btn');
                       setSlideshowActive(false);
@@ -2195,6 +2148,11 @@ const styles = StyleSheet.create({
     zIndex: 999, // sits under the modal content, above the screen content
   },
 
+  blackCover: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+
   viewerHeader: {
     position: 'absolute',
     top: 0,
@@ -2442,7 +2400,6 @@ const menuOptionsStyles = {
 };
 
 export default GalleryScreen;
-
 // // GalleryScreen.js
 // // Note: Full file in one block, with extensive logs and a couple of debug helpers.
 // // - Invokes push-new-image-v1 after each insert (with debug_notify_self: true while you test).
