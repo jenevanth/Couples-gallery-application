@@ -1,4 +1,4 @@
-// GalleryScreen.js - Complete with all fixes
+// GalleryScreen.js - Smooth swipe (no flashes), video in pager with tap-to-play, slideshow seconds picker, and binary share
 import React, {
   useState,
   useEffect,
@@ -25,7 +25,6 @@ import {
   Animated,
   PermissionsAndroid,
   ToastAndroid,
-  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
@@ -39,6 +38,7 @@ import BlobUtil from 'react-native-blob-util';
 import Icon from 'react-native-vector-icons/Ionicons';
 import Modal from 'react-native-modal';
 import Video from 'react-native-video';
+import FastImage from 'react-native-fast-image'; // NEW: eliminate flash with FastImage
 import { format, parseISO, isToday, isSameMonth, isSameWeek } from 'date-fns';
 import {
   Menu,
@@ -68,7 +68,7 @@ const FILTERS = [
 // Instagram-style reactions
 const REACTIONS = ['❤️', '😍', '🔥', '💕', '✨', '😊'];
 
-// Slideshow durations
+// Slideshow presets
 const SLIDESHOW_DURATIONS = [
   { label: '3 sec', value: 3000 },
   { label: '5 sec', value: 5000 },
@@ -76,7 +76,11 @@ const SLIDESHOW_DURATIONS = [
   { label: '15 sec', value: 15000 },
 ];
 
-const { width, height } = Dimensions.get('window');
+const { width } = Dimensions.get('window');
+
+// Transparent PNG placeholder for video slots in the image viewer
+const TRANSPARENT_PNG =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=';
 
 const GalleryScreen = ({ navigation }) => {
   const { theme } = useTheme();
@@ -101,18 +105,25 @@ const GalleryScreen = ({ navigation }) => {
   const [filter, setFilter] = useState('all');
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
 
-  // Photo viewer
+  // Viewer (photos + video placeholders)
   const [isViewerVisible, setIsViewerVisible] = useState(false);
-  const [photoViewerIndex, setPhotoViewerIndex] = useState(0);
-  const [showFooter, setShowFooter] = useState(true);
+  const [viewerIndex, setViewerIndex] = useState(0);
   const [showPhotoInfo, setShowPhotoInfo] = useState(false);
+
+  // Slideshow
   const [slideshowActive, setSlideshowActive] = useState(false);
   const [slideshowDuration, setSlideshowDuration] = useState(5000);
-  const [showDurationPicker, setShowDurationPicker] = useState(false);
+  const [secondsModalVisible, setSecondsModalVisible] = useState(false);
+  const [secondsDraft, setSecondsDraft] = useState(5);
+  const slideshowTimer = useRef(null);
+  const pausedByUserSwipeRef = useRef(false);
+  const swipeResumeTimeoutRef = useRef(null);
 
   // Video viewer
   const [videoVisible, setVideoVisible] = useState(false);
   const [videoUri, setVideoUri] = useState('');
+  const videoSupportedRef = useRef(false);
+  const resumeSlideshowAfterVideoRef = useRef(false);
 
   // Reactions
   const [showReactions, setShowReactions] = useState(false);
@@ -129,8 +140,8 @@ const GalleryScreen = ({ navigation }) => {
     message: '',
   });
 
-  // Slideshow timer
-  const slideshowTimer = useRef(null);
+  // NEW: freeze viewer sources while modal is visible to avoid re-renders (which cause flicker)
+  const [viewerFrozenSources, setViewerFrozenSources] = useState([]);
 
   // Animations
   useEffect(() => {
@@ -149,7 +160,6 @@ const GalleryScreen = ({ navigation }) => {
   }, []);
 
   // Detect native video module
-  const videoSupportedRef = useRef(false);
   useEffect(() => {
     try {
       const cfg = UIManager.getViewManagerConfig
@@ -331,14 +341,49 @@ const GalleryScreen = ({ navigation }) => {
     return list;
   }, [images, search, filter]);
 
-  const photosOnly = useMemo(
-    () => filteredImages.filter(i => i.type !== 'video'),
-    [filteredImages],
-  );
-
   const groupedImages = useMemo(
     () => groupImagesByDate(filteredImages),
     [filteredImages, groupImagesByDate],
+  );
+
+  // Viewer items (photos + videos in one pager)
+  const viewerItems = useMemo(() => filteredImages, [filteredImages]);
+
+  // Stable viewer sources to prevent remount/flicker
+  const viewerSources = useMemo(
+    () =>
+      viewerItems.map(m =>
+        m.type === 'video' ? { uri: TRANSPARENT_PNG } : { uri: m.image_url },
+      ),
+    [viewerItems],
+  );
+
+  // NEW: prefetch current and neighbor images to avoid decode flashes
+  const prefetchNeighbors = useCallback(
+    idx => {
+      try {
+        const targets = [idx - 1, idx, idx + 1]
+          .filter(i => i >= 0 && i < viewerItems.length)
+          .map(i => viewerItems[i])
+          .filter(it => it?.type === 'photo')
+          .map(it => ({
+            uri: it.image_url,
+            priority: FastImage.priority.high,
+          }));
+        if (targets.length) {
+          FastImage.preload(targets);
+          log(
+            '[Viewer] Prefetched neighbors for index:',
+            idx,
+            'count:',
+            targets.length,
+          );
+        }
+      } catch (e) {
+        log('[Viewer] Prefetch error:', e);
+      }
+    },
+    [viewerItems],
   );
 
   // Upload handler
@@ -630,36 +675,72 @@ const GalleryScreen = ({ navigation }) => {
       toggleSelect(item.id);
       return;
     }
-    if (item.type === 'video') {
-      if (videoSupportedRef.current) {
-        setVideoUri(item.image_url);
-        setVideoVisible(true);
-        log('Open video viewer for id:', item.id);
-      } else {
-        log('RCTVideo not available. Opening external player.');
-        Alert.alert(
-          'Opening externally',
-          'Native video module missing; opening in external player.',
-        );
-        Linking.openURL(item.image_url);
-      }
-    } else {
-      const idx = photosOnly.findIndex(p => p.id === item.id);
-      setPhotoViewerIndex(Math.max(0, idx));
+
+    if (item.type !== 'video') {
+      const idx = viewerItems.findIndex(p => p.id === item.id);
+      setViewerIndex(Math.max(0, idx));
       setIsViewerVisible(true);
-      setShowFooter(true);
       setShowReactions(false);
       setShowPhotoInfo(false);
-      setShowDurationPicker(false);
-      log('Open photo viewer for id:', item.id, 'photoIndex:', idx);
+
+      // NEW: freeze sources and prefetch neighbors to avoid flicker
+      setViewerFrozenSources(viewerSources);
+      prefetchNeighbors(idx);
+
+      log('Open viewer for id:', item.id, 'viewerIndex:', idx);
+      return;
+    }
+
+    // If it's a video from grid: open video modal directly
+    if (videoSupportedRef.current) {
+      setVideoUri(item.image_url);
+      setVideoVisible(true);
+      log('Open video viewer for id (from grid):', item.id);
+    } else {
+      log('RCTVideo not available. Opening external player.');
+      Alert.alert(
+        'Opening externally',
+        'Native video module missing; opening in external player.',
+      );
+      Linking.openURL(item.image_url);
     }
   };
 
-  // Single delete (from viewer footer)
+  // Helper: open/close video from inside viewer
+  const openVideoFromViewer = url => {
+    if (slideshowActive) {
+      clearInterval(slideshowTimer.current);
+      slideshowTimer.current = null;
+      setSlideshowActive(false);
+      resumeSlideshowAfterVideoRef.current = true;
+      log('[Viewer->Video] Slideshow paused while opening video');
+    } else {
+      resumeSlideshowAfterVideoRef.current = false;
+    }
+    setVideoUri(url);
+    setVideoVisible(true);
+    log('[Viewer->Video] Video modal opened');
+  };
+
+  const closeVideoModal = () => {
+    log('[Video] Close requested');
+    setVideoVisible(false);
+    if (resumeSlideshowAfterVideoRef.current) {
+      resumeSlideshowAfterVideoRef.current = false;
+      setSlideshowActive(true);
+      startSlideshowTimer('resume-after-video');
+      log('[Video] Resumed slideshow after video');
+    }
+  };
+
+  // Delete (photos only)
   const deleteCurrentPhoto = async () => {
-    const img = photosOnly[photoViewerIndex];
-    if (!img) return;
-    log('Delete current photo requested:', img.id);
+    const item = viewerItems[viewerIndex];
+    if (!item || item.type === 'video') {
+      log('Delete skipped: not a photo at index', viewerIndex);
+      return;
+    }
+    log('Delete current photo requested:', item.id);
     Alert.alert('Delete', 'Delete this photo?', [
       { text: 'Cancel', style: 'cancel' },
       {
@@ -669,55 +750,109 @@ const GalleryScreen = ({ navigation }) => {
           const { error } = await supabase
             .from('images')
             .delete()
-            .eq('id', img.id);
+            .eq('id', item.id);
           if (error) {
             setErrorModal({ visible: true, message: error.message });
             log('Delete error:', error);
           } else {
             setIsViewerVisible(false);
+            setViewerFrozenSources([]); // NEW: unfreeze when closing
             fetchImages();
-            log('Deleted photo id:', img.id);
+            log('Deleted photo id:', item.id);
           }
         },
       },
     ]);
   };
 
+  // Share as actual file (image/video), fallback to link
   const handleShareCurrent = async () => {
     try {
-      const img = photosOnly[photoViewerIndex];
-      if (!img) return;
-      await Share.open({ url: img.image_url });
-      log('Shared photo:', img.image_url);
+      const item = viewerItems[viewerIndex];
+      if (!item) return;
+
+      const url = item.image_url;
+      const isVideo = item.type === 'video';
+      const defaultExt = isVideo ? 'mp4' : 'jpg';
+      const cleanUrl = url.split('?')[0];
+      const extFromUrl = cleanUrl.includes('.')
+        ? cleanUrl.split('.').pop()
+        : defaultExt;
+      const ext =
+        (extFromUrl || defaultExt).toLowerCase().replace(/[^a-z0-9]/gi, '') ||
+        defaultExt;
+
+      const cachePath = `${
+        BlobUtil.fs.dirs.CacheDir
+      }/share_${Date.now()}.${ext}`;
+      log('[Share] Downloading to cache:', cachePath);
+
+      await BlobUtil.config({ path: cachePath, fileCache: true }).fetch(
+        'GET',
+        url,
+      );
+      const fileUrl = `file://${cachePath}`;
+      const mime = isVideo
+        ? 'video/mp4'
+        : `image/${ext === 'jpg' ? 'jpeg' : ext}`;
+
+      log('[Share] Share.open file:', fileUrl, 'mime:', mime);
+      await Share.open({
+        url: fileUrl,
+        type: mime,
+        failOnCancel: false,
+      });
+      log('[Share] Completed.');
     } catch (e) {
-      log('Share error:', e);
-      if (e?.message !== 'User did not share') {
-        setErrorModal({ visible: true, message: e.message });
+      log('[Share] binary failed, falling back to link:', e?.message || e);
+      try {
+        const item = viewerItems[viewerIndex];
+        await Share.open({ url: item.image_url, failOnCancel: false });
+      } catch (e2) {
+        if (e2?.message !== 'User did not share') {
+          setErrorModal({
+            visible: true,
+            message: e2.message || 'Share failed',
+          });
+        }
       }
     }
   };
 
   const handleSaveCurrent = async () => {
     try {
-      const img = photosOnly[photoViewerIndex];
-      if (!img) return;
+      const item = viewerItems[viewerIndex];
+      if (!item) return;
 
-      // Request permissions for Android
+      const isVideo = item.type === 'video';
+      if (isVideo) {
+        log('Save requested on video - prompt to open video player');
+        Alert.alert(
+          'Open Video',
+          'Use the video player to download/share the video.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Open',
+              onPress: () => openVideoFromViewer(item.image_url),
+            },
+          ],
+        );
+        return;
+      }
+
+      // Android permissions
       if (Platform.OS === 'android') {
         try {
           const androidVersion = Platform.Version;
-
           if (androidVersion >= 33) {
-            // Android 13+
             const granted = await PermissionsAndroid.requestMultiple([
               PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
               PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
             ]);
-
             const allGranted = Object.values(granted).every(
               p => p === PermissionsAndroid.RESULTS.GRANTED,
             );
-
             if (!allGranted) {
               setErrorModal({
                 visible: true,
@@ -726,7 +861,6 @@ const GalleryScreen = ({ navigation }) => {
               return;
             }
           } else {
-            // Android 12 and below
             const granted = await PermissionsAndroid.request(
               PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
               {
@@ -737,7 +871,6 @@ const GalleryScreen = ({ navigation }) => {
                 buttonPositive: 'OK',
               },
             );
-
             if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
               setErrorModal({
                 visible: true,
@@ -751,11 +884,10 @@ const GalleryScreen = ({ navigation }) => {
         }
       }
 
-      const fileUrl = img.image_url;
+      const fileUrl = item.image_url;
       const fileName =
-        img.file_name || fileUrl.split('/').pop() || `image_${Date.now()}.jpg`;
+        item.file_name || fileUrl.split('/').pop() || `image_${Date.now()}.jpg`;
       const dirs = BlobUtil.fs.dirs;
-
       const dest =
         Platform.OS === 'android'
           ? `${dirs.PictureDir}/Gallery/${fileName}`
@@ -775,7 +907,6 @@ const GalleryScreen = ({ navigation }) => {
             description: 'Downloading image...',
           },
         };
-
         await BlobUtil.config(configOptions).fetch('GET', fileUrl);
         ToastAndroid.show(
           `Saved to Pictures/Gallery/${fileName}`,
@@ -794,58 +925,57 @@ const GalleryScreen = ({ navigation }) => {
   };
 
   const toggleFavoriteCurrent = async () => {
-    const img = photosOnly[photoViewerIndex];
-    if (!img) return;
+    const item = viewerItems[viewerIndex];
+    if (!item || item.type === 'video') {
+      log('Favorite toggle skipped: not a photo at index', viewerIndex);
+      return;
+    }
     try {
-      const updated = !img.favorite;
+      const updated = !item.favorite;
       await supabase
         .from('images')
         .update({ favorite: updated })
-        .eq('id', img.id);
+        .eq('id', item.id);
       setImages(prev =>
-        prev.map(i => (i.id === img.id ? { ...i, favorite: updated } : i)),
+        prev.map(i => (i.id === item.id ? { ...i, favorite: updated } : i)),
       );
-      log('Toggled favorite id:', img.id, '->', updated);
+      log('Toggled favorite id:', item.id, '->', updated);
     } catch (e) {
       setErrorModal({ visible: true, message: e.message });
       log('Toggle favorite error:', e);
     }
   };
 
-  // Toggle reaction (Instagram-style)
+  // Reactions (photos only)
   const toggleReaction = async emoji => {
-    const img = photosOnly[photoViewerIndex];
-    if (!img) return;
-
+    const item = viewerItems[viewerIndex];
+    if (!item || item.type === 'video') {
+      log('Reaction skipped: not a photo at index', viewerIndex);
+      return;
+    }
     try {
-      // Check if user already reacted with this emoji
-      const existingReactions = imageReactions[img.id] || [];
+      const existingReactions = imageReactions[item.id] || [];
       const userReaction = existingReactions.find(
         r => r.user_id === userId && r.emoji === emoji,
       );
 
       if (userReaction) {
-        // Remove reaction if already exists
-        log('Removing reaction:', emoji, 'from image:', img.id);
+        log('Removing reaction:', emoji, 'from image:', item.id);
         const { error } = await supabase
           .from('reactions')
           .delete()
-          .match({ image_id: img.id, user_id: userId, emoji });
-
+          .match({ image_id: item.id, user_id: userId, emoji });
         if (error) throw error;
 
-        // Update local state
         setImageReactions(prev => ({
           ...prev,
-          [img.id]: prev[img.id].filter(
+          [item.id]: prev[item.id].filter(
             r => !(r.user_id === userId && r.emoji === emoji),
           ),
         }));
-
         log('Removed reaction successfully');
       } else {
-        // Add new reaction
-        log('Adding reaction:', emoji, 'to image:', img.id);
+        log('Adding reaction:', emoji, 'to image:', item.id);
         Animated.sequence([
           Animated.timing(reactionAnim, {
             toValue: 1,
@@ -860,20 +990,17 @@ const GalleryScreen = ({ navigation }) => {
         ]).start();
 
         const { error } = await supabase.from('reactions').insert({
-          image_id: img.id,
+          image_id: item.id,
           user_id: userId,
           emoji,
           created_at: new Date().toISOString(),
         });
-
         if (error) throw error;
 
-        // Update local state immediately
         setImageReactions(prev => ({
           ...prev,
-          [img.id]: [...(prev[img.id] || []), { user_id: userId, emoji }],
+          [item.id]: [...(prev[item.id] || []), { user_id: userId, emoji }],
         }));
-
         log('Added reaction successfully');
       }
     } catch (e) {
@@ -882,45 +1009,76 @@ const GalleryScreen = ({ navigation }) => {
     }
   };
 
-  // Start/stop slideshow with custom duration
-  const toggleSlideshow = () => {
-    if (slideshowActive) {
+  // Slideshow
+  const startSlideshowTimer = (reason = 'start') => {
+    if (slideshowTimer.current) clearInterval(slideshowTimer.current);
+    if (!viewerItems.length) return;
+
+    slideshowTimer.current = setInterval(() => {
+      setViewerIndex(prev => {
+        const next = (prev + 1) % viewerItems.length;
+        log('[Slideshow]', reason, 'tick -> next index:', next);
+        return next;
+      });
+    }, slideshowDuration);
+    log(
+      '[Slideshow] Timer (re)started. every:',
+      slideshowDuration,
+      'ms reason:',
+      reason,
+    );
+  };
+
+  const stopSlideshowTimer = (reason = 'stop') => {
+    if (slideshowTimer.current) {
       clearInterval(slideshowTimer.current);
-      setSlideshowActive(false);
-      log('Slideshow stopped');
-    } else {
-      setSlideshowActive(true);
-      slideshowTimer.current = setInterval(() => {
-        setPhotoViewerIndex(prev => {
-          const next = (prev + 1) % photosOnly.length;
-          log('Slideshow next photo:', next, 'duration:', slideshowDuration);
-          return next;
-        });
-      }, slideshowDuration);
-      log('Slideshow started with duration:', slideshowDuration);
+      slideshowTimer.current = null;
+      log('[Slideshow] Timer stopped. reason:', reason);
     }
   };
 
-  // Update slideshow when duration changes
+  const promptSlideshowSeconds = () => {
+    setSecondsDraft(
+      Math.max(1, Math.min(30, Math.round(slideshowDuration / 1000))),
+    );
+    setSecondsModalVisible(true);
+    log('[Slideshow] Seconds picker opened');
+  };
+
+  const confirmSlideshowSeconds = () => {
+    const ms = Math.max(1, Math.min(30, secondsDraft)) * 1000;
+    setSecondsModalVisible(false);
+    setSlideshowDuration(ms);
+    setSlideshowActive(true);
+    startSlideshowTimer('confirm-seconds');
+    log('[Slideshow] Started with:', ms, 'ms');
+  };
+
+  const toggleSlideshow = () => {
+    if (slideshowActive) {
+      stopSlideshowTimer('toggle-off');
+      setSlideshowActive(false);
+      log('Slideshow stopped');
+    } else {
+      promptSlideshowSeconds();
+    }
+  };
+
+  // Update slideshow when duration changes (if running)
   useEffect(() => {
     if (slideshowActive) {
-      clearInterval(slideshowTimer.current);
-      slideshowTimer.current = setInterval(() => {
-        setPhotoViewerIndex(prev => {
-          const next = (prev + 1) % photosOnly.length;
-          return next;
-        });
-      }, slideshowDuration);
+      startSlideshowTimer('duration-change');
       log('Slideshow duration updated to:', slideshowDuration);
     }
-  }, [slideshowDuration, slideshowActive, photosOnly.length]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slideshowDuration, slideshowActive, viewerItems.length]);
 
-  // Cleanup slideshow on unmount
+  // Cleanup
   useEffect(() => {
     return () => {
-      if (slideshowTimer.current) {
-        clearInterval(slideshowTimer.current);
-      }
+      stopSlideshowTimer('unmount');
+      if (swipeResumeTimeoutRef.current)
+        clearTimeout(swipeResumeTimeoutRef.current);
     };
   }, []);
 
@@ -963,8 +1121,31 @@ const GalleryScreen = ({ navigation }) => {
       .filter(i => selectedIds.includes(i.id))
       .map(i => i.image_url);
     try {
-      await Share.open({ urls });
-      log('Batch share urls:', urls.length);
+      // Download all and share as files
+      const paths = [];
+      for (const url of urls) {
+        try {
+          const clean = url.split('?')[0];
+          const ext = clean.includes('.') ? clean.split('.').pop() : 'jpg';
+          const path = `${
+            BlobUtil.fs.dirs.CacheDir
+          }/share_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+          await BlobUtil.config({ path, fileCache: true }).fetch('GET', url);
+          paths.push(`file://${path}`);
+        } catch (e) {
+          log(
+            '[Batch Share] One file failed, will still share others:',
+            e?.message || e,
+          );
+        }
+      }
+      if (paths.length) {
+        await Share.open({ urls: paths, failOnCancel: false });
+        log('Batch share file count:', paths.length);
+      } else {
+        await Share.open({ urls, failOnCancel: false });
+        log('Batch share link fallback count:', urls.length);
+      }
     } catch (e) {
       log('Batch share error/cancel:', e?.message || e);
     }
@@ -1008,10 +1189,7 @@ const GalleryScreen = ({ navigation }) => {
         key={date}
         style={[
           styles.section,
-          {
-            opacity: fadeAnim,
-            transform: [{ scale: scaleAnim }],
-          },
+          { opacity: fadeAnim, transform: [{ scale: scaleAnim }] },
         ]}
       >
         <LinearGradient
@@ -1267,10 +1445,7 @@ const GalleryScreen = ({ navigation }) => {
         <Animated.View
           style={[
             styles.searchBar,
-            {
-              opacity: fadeAnim,
-              transform: [{ scale: scaleAnim }],
-            },
+            { opacity: fadeAnim, transform: [{ scale: scaleAnim }] },
           ]}
         >
           <LinearGradient
@@ -1324,10 +1499,7 @@ const GalleryScreen = ({ navigation }) => {
           <Animated.View
             style={[
               styles.dropdown,
-              {
-                opacity: fadeAnim,
-                transform: [{ scale: scaleAnim }],
-              },
+              { opacity: fadeAnim, transform: [{ scale: scaleAnim }] },
             ]}
           >
             {FILTERS.map(f => (
@@ -1395,14 +1567,7 @@ const GalleryScreen = ({ navigation }) => {
 
         {/* Upload Progress */}
         {uploading && (
-          <Animated.View
-            style={[
-              styles.uploadStatus,
-              {
-                opacity: fadeAnim,
-              },
-            ]}
-          >
+          <Animated.View style={[styles.uploadStatus, { opacity: fadeAnim }]}>
             <LinearGradient
               colors={[
                 theme.colors.primary + 'DD',
@@ -1416,124 +1581,169 @@ const GalleryScreen = ({ navigation }) => {
           </Animated.View>
         )}
 
-        {/* Enhanced Photo Viewer with Instagram-like features */}
+        {/* Solid black backdrop under the viewer to prevent any flashes */}
+        {isViewerVisible && (
+          <View pointerEvents="none" style={styles.viewerBackdrop} />
+        )}
+
+        {/* Media Viewer (photos + video placeholders) */}
         <ImageViewing
-          images={photosOnly.map(img => ({ uri: img.image_url }))}
-          imageIndex={photoViewerIndex}
+          images={
+            viewerFrozenSources.length ? viewerFrozenSources : viewerSources
+          } // NEW: frozen while open
+          imageIndex={viewerIndex}
           visible={isViewerVisible}
           onRequestClose={() => {
             setIsViewerVisible(false);
-            if (slideshowActive) toggleSlideshow();
+            setViewerFrozenSources([]); // NEW: unfreeze on close
+            if (slideshowActive) {
+              stopSlideshowTimer('viewer-close');
+              setSlideshowActive(false);
+            }
           }}
+          // Important: solid, opaque background and full screen prevent flashes
+          backgroundColor="#000"
+          presentationStyle="fullScreen"
+          statusBarTranslucent
+          animationType="none"
           doubleTapToZoomEnabled
           swipeToCloseEnabled
-          onImageIndexChange={idx => {
-            setPhotoViewerIndex(idx);
-            setShowFooter(true);
-            setShowReactions(false);
-            setShowPhotoInfo(false);
-            setShowDurationPicker(false);
+          // Ensure the image areas are fully black (no transparency)
+          imageContainerStyle={{ backgroundColor: '#000' }}
+          // NEW: render with FastImage and disable decode fade
+          ImageComponent={FastImage}
+          imageProps={{
+            fadeDuration: 0, // Android RN Image fade (harmless for FastImage)
+            resizeMode: FastImage.resizeMode.contain,
+            onLoadStart: () =>
+              log('[Viewer] image load start idx:', viewerIndex),
+            onLoad: () => log('[Viewer] image loaded idx:', viewerIndex),
+            onError: e =>
+              log(
+                '[Viewer] image load error idx:',
+                viewerIndex,
+                e?.nativeEvent || e,
+              ),
           }}
-          HeaderComponent={() => (
-            <LinearGradient
-              colors={['rgba(0,0,0,0.7)', 'transparent']}
-              style={styles.viewerHeader}
-            >
-              <TouchableOpacity
-                onPress={() => {
-                  setIsViewerVisible(false);
-                  if (slideshowActive) toggleSlideshow();
-                }}
-                style={styles.viewerCloseButton}
+          onImageIndexChange={idx => {
+            setViewerIndex(idx);
+            prefetchNeighbors(idx); // NEW: keep next/prev ready
+
+            // Smooth swipe: pause slideshow during swipe and resume shortly after
+            if (slideshowActive) {
+              pausedByUserSwipeRef.current = true;
+              stopSlideshowTimer('user-swipe');
+              setSlideshowActive(false);
+              if (swipeResumeTimeoutRef.current) {
+                clearTimeout(swipeResumeTimeoutRef.current);
+              }
+              swipeResumeTimeoutRef.current = setTimeout(() => {
+                if (pausedByUserSwipeRef.current) {
+                  pausedByUserSwipeRef.current = false;
+                  setSlideshowActive(true);
+                  startSlideshowTimer('resume-after-swipe');
+                }
+              }, 600);
+            }
+          }}
+          HeaderComponent={() => {
+            const item = viewerItems[viewerIndex];
+            const isVideo = item?.type === 'video';
+            return (
+              <LinearGradient
+                colors={['rgba(0,0,0,0.7)', 'transparent']}
+                style={styles.viewerHeader}
               >
-                <Icon name="close" size={28} color="#FFFFFF" />
-              </TouchableOpacity>
-              <View style={styles.viewerHeaderActions}>
                 <TouchableOpacity
-                  onPress={() => setShowDurationPicker(v => !v)}
-                  style={styles.viewerHeaderButton}
+                  onPress={() => {
+                    setIsViewerVisible(false);
+                    setViewerFrozenSources([]); // NEW: unfreeze on close button
+                    if (slideshowActive) {
+                      stopSlideshowTimer('viewer-close-btn');
+                      setSlideshowActive(false);
+                    }
+                  }}
+                  style={styles.viewerCloseButton}
                 >
-                  <Icon name="time" size={24} color="#FFFFFF" />
+                  <Icon name="close" size={28} color="#FFFFFF" />
                 </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={toggleSlideshow}
-                  style={styles.viewerHeaderButton}
-                >
-                  <Icon
-                    name={slideshowActive ? 'pause' : 'play'}
-                    size={24}
-                    color="#FFFFFF"
-                  />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => setShowPhotoInfo(v => !v)}
-                  style={styles.viewerHeaderButton}
-                >
-                  <Icon name="information-circle" size={24} color="#FFFFFF" />
-                </TouchableOpacity>
-              </View>
-            </LinearGradient>
-          )}
+                <View style={styles.viewerHeaderActions}>
+                  <TouchableOpacity
+                    onPress={toggleSlideshow}
+                    style={styles.viewerHeaderButton}
+                  >
+                    <Icon
+                      name={slideshowActive ? 'pause' : 'play'}
+                      size={24}
+                      color="#FFFFFF"
+                    />
+                  </TouchableOpacity>
+
+                  {!isVideo && (
+                    <TouchableOpacity
+                      onPress={() => setShowPhotoInfo(v => !v)}
+                      style={styles.viewerHeaderButton}
+                    >
+                      <Icon
+                        name="information-circle"
+                        size={24}
+                        color="#FFFFFF"
+                      />
+                    </TouchableOpacity>
+                  )}
+                </View>
+              </LinearGradient>
+            );
+          }}
           FooterComponent={() => {
-            const img = photosOnly[photoViewerIndex];
-            if (!img) return null;
-            const reactions = imageReactions[img.id] || [];
+            const item = viewerItems[viewerIndex];
+            if (!item) return null;
+            const isVideo = item.type === 'video';
+            const reactions = imageReactions[item.id] || [];
 
             return (
-              <View>
-                {/* Slideshow Duration Picker */}
-                {showDurationPicker && (
-                  <View style={styles.durationPicker}>
-                    {SLIDESHOW_DURATIONS.map(duration => (
-                      <TouchableOpacity
-                        key={duration.value}
-                        onPress={() => {
-                          setSlideshowDuration(duration.value);
-                          setShowDurationPicker(false);
-                          log('Slideshow duration set to:', duration.label);
-                        }}
-                        style={[
-                          styles.durationOption,
-                          slideshowDuration === duration.value &&
-                            styles.durationOptionActive,
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.durationText,
-                            slideshowDuration === duration.value &&
-                              styles.durationTextActive,
-                          ]}
-                        >
-                          {duration.label}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
+              <View pointerEvents="box-none">
+                {/* Video overlay: no closing viewer, no flashes */}
+                {isVideo && (
+                  <View
+                    style={styles.videoOverlayContainer}
+                    pointerEvents="box-none"
+                  >
+                    <TouchableOpacity
+                      onPress={() => openVideoFromViewer(item.image_url)}
+                      style={styles.videoOverlayButton}
+                      activeOpacity={0.8}
+                    >
+                      <Icon name="play-circle" size={56} color="#FFFFFF" />
+                      <Text style={styles.videoOverlayText}>
+                        Tap to play video
+                      </Text>
+                    </TouchableOpacity>
                   </View>
                 )}
 
                 {/* Photo Info Panel */}
-                {showPhotoInfo && (
+                {!isVideo && showPhotoInfo && (
                   <LinearGradient
                     colors={['transparent', 'rgba(0,0,0,0.9)']}
                     style={styles.photoInfoPanel}
                   >
                     <Text style={styles.photoInfoTitle}>Photo Details</Text>
                     <Text style={styles.photoInfoText}>
-                      Name: {img.file_name || 'Untitled'}
+                      Name: {item.file_name || 'Untitled'}
                     </Text>
                     <Text style={styles.photoInfoText}>
-                      Date: {format(parseISO(img.created_at), 'PPpp')}
+                      Date: {format(parseISO(item.created_at), 'PPpp')}
                     </Text>
                     <Text style={styles.photoInfoText}>
-                      Storage: {img.storage_type}
+                      Storage: {item.storage_type}
                     </Text>
-                    <Text style={styles.photoInfoText}>Type: {img.type}</Text>
+                    <Text style={styles.photoInfoText}>Type: {item.type}</Text>
                   </LinearGradient>
                 )}
 
-                {/* Instagram-style reactions with transparent background */}
-                {showReactions && (
+                {/* Reactions (photos only) */}
+                {!isVideo && showReactions && (
                   <View style={styles.reactionsContainer}>
                     <ScrollView
                       horizontal
@@ -1556,11 +1766,7 @@ const GalleryScreen = ({ navigation }) => {
                               style={[
                                 styles.reactionEmoji,
                                 {
-                                  transform: [
-                                    {
-                                      scale: hasReacted ? 1.2 : 1,
-                                    },
-                                  ],
+                                  transform: [{ scale: hasReacted ? 1.2 : 1 }],
                                 },
                               ]}
                             >
@@ -1573,8 +1779,8 @@ const GalleryScreen = ({ navigation }) => {
                   </View>
                 )}
 
-                {/* Display reactions */}
-                {reactions.length > 0 && (
+                {/* Display reactions (photos only) */}
+                {!isVideo && reactions.length > 0 && (
                   <View style={styles.reactionsDisplay}>
                     <View style={styles.reactionsRow}>
                       {reactions.slice(0, 5).map((r, idx) => (
@@ -1591,7 +1797,7 @@ const GalleryScreen = ({ navigation }) => {
                   </View>
                 )}
 
-                {/* Main Footer Actions */}
+                {/* Footer actions */}
                 <LinearGradient
                   colors={['transparent', 'rgba(0,0,0,0.8)']}
                   style={styles.viewerFooter}
@@ -1608,39 +1814,124 @@ const GalleryScreen = ({ navigation }) => {
                   >
                     <Icon name="download" size={24} color="#FFFFFF" />
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.viewerButton}
-                    onPress={toggleFavoriteCurrent}
-                  >
-                    <Icon
-                      name={img.favorite ? 'heart' : 'heart-outline'}
-                      size={24}
-                      color={img.favorite ? theme.shared.red : '#FFFFFF'}
-                    />
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.viewerButton}
-                    onPress={() => setShowReactions(v => !v)}
-                  >
-                    <Icon name="happy" size={24} color="#FFFFFF" />
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.viewerButton}
-                    onPress={deleteCurrentPhoto}
-                  >
-                    <Icon name="trash" size={24} color={theme.shared.red} />
-                  </TouchableOpacity>
+
+                  {!isVideo && (
+                    <>
+                      <TouchableOpacity
+                        style={styles.viewerButton}
+                        onPress={toggleFavoriteCurrent}
+                      >
+                        <Icon
+                          name={
+                            viewerItems[viewerIndex].favorite
+                              ? 'heart'
+                              : 'heart-outline'
+                          }
+                          size={24}
+                          color={
+                            viewerItems[viewerIndex].favorite
+                              ? theme.shared.red
+                              : '#FFFFFF'
+                          }
+                        />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.viewerButton}
+                        onPress={() => setShowReactions(v => !v)}
+                      >
+                        <Icon name="happy" size={24} color="#FFFFFF" />
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.viewerButton}
+                        onPress={deleteCurrentPhoto}
+                      >
+                        <Icon name="trash" size={24} color={theme.shared.red} />
+                      </TouchableOpacity>
+                    </>
+                  )}
                 </LinearGradient>
               </View>
             );
           }}
         />
 
+        {/* Slideshow seconds modal */}
+        <Modal
+          isVisible={secondsModalVisible}
+          onBackdropPress={() => setSecondsModalVisible(false)}
+          onBackButtonPress={() => setSecondsModalVisible(false)}
+          backdropOpacity={0.5}
+          useNativeDriver
+        >
+          <View style={styles.secondsModal}>
+            <Text style={styles.secondsTitle}>Slideshow interval</Text>
+
+            <View style={styles.secondsChips}>
+              {SLIDESHOW_DURATIONS.map(d => (
+                <TouchableOpacity
+                  key={d.value}
+                  style={[
+                    styles.secondsChip,
+                    secondsDraft === d.value / 1000 && styles.secondsChipActive,
+                  ]}
+                  onPress={() => setSecondsDraft(d.value / 1000)}
+                >
+                  <Text
+                    style={[
+                      styles.secondsChipText,
+                      secondsDraft === d.value / 1000 &&
+                        styles.secondsChipTextActive,
+                    ]}
+                  >
+                    {d.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <View style={styles.secondsRow}>
+              <TouchableOpacity
+                onPress={() => setSecondsDraft(s => Math.max(1, s - 1))}
+                style={styles.secondsBtn}
+              >
+                <Icon name="remove" size={22} color="#fff" />
+              </TouchableOpacity>
+
+              <Text style={styles.secondsValue}>{secondsDraft}s</Text>
+
+              <TouchableOpacity
+                onPress={() => setSecondsDraft(s => Math.min(30, s + 1))}
+                style={styles.secondsBtn}
+              >
+                <Icon name="add" size={22} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.secondsActions}>
+              <TouchableOpacity
+                onPress={() => setSecondsModalVisible(false)}
+                style={[styles.secondsActionBtn, { backgroundColor: '#555' }]}
+              >
+                <Text style={styles.secondsActionText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={confirmSlideshowSeconds}
+                style={[
+                  styles.secondsActionBtn,
+                  { backgroundColor: theme.colors.primary },
+                ]}
+              >
+                <Text style={styles.secondsActionText}>Start</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
         {/* Video Viewer */}
         <Modal
           isVisible={videoVisible}
-          onBackdropPress={() => setVideoVisible(false)}
-          onBackButtonPress={() => setVideoVisible(false)}
+          onBackdropPress={closeVideoModal}
+          onBackButtonPress={closeVideoModal}
           style={{ margin: 0 }}
           useNativeDriver
           hideModalContentWhileAnimating
@@ -1657,7 +1948,7 @@ const GalleryScreen = ({ navigation }) => {
               posterResizeMode="cover"
             />
             <TouchableOpacity
-              onPress={() => setVideoVisible(false)}
+              onPress={closeVideoModal}
               style={styles.videoCloseButton}
             >
               <LinearGradient
@@ -1688,7 +1979,7 @@ const GalleryScreen = ({ navigation }) => {
   );
 };
 
-// Enhanced Styles
+// Styles
 const styles = StyleSheet.create({
   container: { flex: 1 },
   loader: {
@@ -1898,6 +2189,12 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
 
+  viewerBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#000',
+    zIndex: 999, // sits under the modal content, above the screen content
+  },
+
   viewerHeader: {
     position: 'absolute',
     top: 0,
@@ -1941,29 +2238,25 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
   },
 
-  durationPicker: {
+  // Video overlay inside viewer
+  videoOverlayContainer: {
     position: 'absolute',
-    top: 80,
-    right: 20,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    borderRadius: 12,
-    padding: 8,
+    top: '40%',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 9,
   },
-  durationOption: {
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    marginVertical: 2,
+  videoOverlayButton: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 10,
   },
-  durationOptionActive: {
-    backgroundColor: 'rgba(255,255,255,0.2)',
-  },
-  durationText: {
-    color: '#FFFFFF',
-    fontSize: 14,
-  },
-  durationTextActive: {
-    fontWeight: 'bold',
+  videoOverlayText: {
+    color: '#fff',
+    marginTop: 8,
+    fontWeight: '600',
+    fontSize: 16,
   },
 
   photoInfoPanel: {
@@ -1986,7 +2279,7 @@ const styles = StyleSheet.create({
     marginVertical: 2,
   },
 
-  // FIXED: Transparent background for reactions
+  // Reactions
   reactionsContainer: {
     position: 'absolute',
     bottom: 100,
@@ -1994,7 +2287,7 @@ const styles = StyleSheet.create({
     right: 0,
     paddingHorizontal: 20,
     paddingVertical: 10,
-    backgroundColor: 'transparent', // No background color - fully transparent
+    backgroundColor: 'transparent',
   },
   reactionButton: {
     paddingHorizontal: 15,
@@ -2056,6 +2349,68 @@ const styles = StyleSheet.create({
     marginLeft: 12,
     fontSize: 15,
   },
+
+  // Seconds modal
+  secondsModal: {
+    backgroundColor: '#222',
+    padding: 16,
+    borderRadius: 16,
+  },
+  secondsTitle: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 16,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  secondsChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+  },
+  secondsChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: '#333',
+    margin: 4,
+  },
+  secondsChipActive: { backgroundColor: '#555' },
+  secondsChipText: { color: '#eee', fontSize: 13, fontWeight: '600' },
+  secondsChipTextActive: { color: '#fff' },
+  secondsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 10,
+  },
+  secondsBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#444',
+  },
+  secondsValue: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 18,
+    marginHorizontal: 16,
+  },
+  secondsActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 16,
+  },
+  secondsActionBtn: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    marginHorizontal: 6,
+    alignItems: 'center',
+  },
+  secondsActionText: { color: '#fff', fontWeight: '700' },
 
   videoCloseButton: {
     position: 'absolute',

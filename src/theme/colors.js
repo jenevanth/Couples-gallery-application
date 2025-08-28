@@ -7,7 +7,7 @@ export const COLORS = {
     secondary: '#C44569',
     light: '#FFF0F6',
     ultraLight: '#FFEEF8',
-    gradient: ['#FF6B9D', '#FFC857', '#E63946'],
+    gradient: ['#FF006E', '#FF4B92', '#FF85A3'], // Clean pink gradient
     accent: '#FF006E',
     pastel: '#FFDDE4',
     neon: '#FF10F0',
@@ -24,13 +24,14 @@ export const COLORS = {
   },
   shared: {
     purple: '#7209B7',
-    orange: '#F72585',
-    yellow: '#FFD60A',
+    orange: '#FF6B6B',
+    yellow: '#FF9D9D',
     green: '#06FFA5',
     red: '#E63946',
-    gold: '#FFB700',
+    gold: '#FFB7C5',
     silver: '#C0C0C0',
     bronze: '#CD7F32',
+    gradient: ['#FF6B9D', '#FF4B92', '#FF2D87'],
   },
   gray: {
     light: '#F7F7F7',
