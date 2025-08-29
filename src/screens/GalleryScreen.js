@@ -26,7 +26,6 @@ import {
   PermissionsAndroid,
   ToastAndroid,
 } from 'react-native';
-import { Modal as RNModal } from 'react-native'; // NEW: blackout overlay modal (zero animation)
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
 import { supabase } from '../services/supabase';
@@ -140,6 +139,14 @@ const GalleryScreen = ({ navigation }) => {
     message: '',
   });
 
+  // NEW: Freeze the images array used by the viewer while open (prevents re-mount flash)
+  const [viewerFrozenSources, setViewerFrozenSources] = useState([]);
+  // NEW: Know if viewer is open (to pause realtime refresh)
+  const viewerOpenRef = useRef(false);
+  useEffect(() => {
+    viewerOpenRef.current = isViewerVisible;
+  }, [isViewerVisible]);
+
   // Animations
   useEffect(() => {
     Animated.parallel([
@@ -182,6 +189,7 @@ const GalleryScreen = ({ navigation }) => {
     progress,
     slideshowActive,
     slideshowDuration,
+    viewerOpen: isViewerVisible,
   });
 
   // Load auth + avatar + profile
@@ -277,6 +285,12 @@ const GalleryScreen = ({ navigation }) => {
             payload.eventType,
             payload.new?.id || payload.old?.id,
           );
+          if (viewerOpenRef.current) {
+            log(
+              'Viewer is open - skipping fetchImages to avoid mid-swipe re-render',
+            );
+            return;
+          }
           fetchImages();
         },
       )
@@ -289,6 +303,12 @@ const GalleryScreen = ({ navigation }) => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'reactions' },
         () => {
+          if (viewerOpenRef.current) {
+            log(
+              'Viewer is open - skipping reactions refresh to avoid mid-swipe re-render',
+            );
+            return;
+          }
           fetchReactions();
         },
       )
@@ -315,8 +335,8 @@ const GalleryScreen = ({ navigation }) => {
   // Filters
   const filteredImages = useMemo(() => {
     let list = images;
-    if (search) {
-      const q = search.toLowerCase();
+    const q = search?.toLowerCase();
+    if (q) {
       list = list.filter(
         img =>
           img.image_url?.toLowerCase().includes(q) ||
@@ -651,7 +671,16 @@ const GalleryScreen = ({ navigation }) => {
       setIsViewerVisible(true);
       setShowReactions(false);
       setShowPhotoInfo(false);
-      log('Open viewer for id:', item.id, 'viewerIndex:', idx);
+      // Freeze sources so any list updates don't re-render the pager mid-swipe
+      setViewerFrozenSources(viewerSources);
+      log(
+        'Open viewer for id:',
+        item.id,
+        'viewerIndex:',
+        idx,
+        'frozen:',
+        viewerSources.length,
+      );
       return;
     }
 
@@ -720,6 +749,7 @@ const GalleryScreen = ({ navigation }) => {
             log('Delete error:', error);
           } else {
             setIsViewerVisible(false);
+            setViewerFrozenSources([]); // unfreeze on close
             fetchImages();
             log('Deleted photo id:', item.id);
           }
@@ -1549,33 +1579,28 @@ const GalleryScreen = ({ navigation }) => {
           <View pointerEvents="none" style={styles.viewerBackdrop} />
         )}
 
-        {/* Blackout overlay under the viewer to prevent any flicker of the screen */}
-        <RNModal
-          visible={isViewerVisible}
-          transparent
-          statusBarTranslucent
-          animationType="none"
-          hardwareAccelerated
-        >
-          <View style={styles.blackCover} />
-        </RNModal>
-
         {/* Media Viewer (photos + video placeholders) */}
         <ImageViewing
-          images={viewerSources}
+          images={
+            viewerFrozenSources.length ? viewerFrozenSources : viewerSources
+          }
           imageIndex={viewerIndex}
           visible={isViewerVisible}
           onRequestClose={() => {
             setIsViewerVisible(false);
+            setViewerFrozenSources([]); // unfreeze on close
             if (slideshowActive) {
               stopSlideshowTimer('viewer-close');
               setSlideshowActive(false);
             }
+            // Catch up once with any missed realtime updates
+            fetchImages();
+            fetchReactions();
           }}
           // Important: solid, opaque background and full screen prevent flashes
           backgroundColor="#000"
-          presentationStyle="fullScreen"
-          statusBarTranslucent
+          // presentationStyle removed to match simpler behavior
+          // statusBarTranslucent removed to avoid Android edge flash
           animationType="none"
           doubleTapToZoomEnabled
           swipeToCloseEnabled
@@ -1611,10 +1636,13 @@ const GalleryScreen = ({ navigation }) => {
                 <TouchableOpacity
                   onPress={() => {
                     setIsViewerVisible(false);
+                    setViewerFrozenSources([]); // unfreeze on close via X
                     if (slideshowActive) {
                       stopSlideshowTimer('viewer-close-btn');
                       setSlideshowActive(false);
                     }
+                    fetchImages();
+                    fetchReactions();
                   }}
                   style={styles.viewerCloseButton}
                 >
@@ -2145,12 +2173,7 @@ const styles = StyleSheet.create({
   viewerBackdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: '#000',
-    zIndex: 999, // sits under the modal content, above the screen content
-  },
-
-  blackCover: {
-    flex: 1,
-    backgroundColor: '#000',
+    zIndex: 999,
   },
 
   viewerHeader: {
