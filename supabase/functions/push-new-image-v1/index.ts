@@ -1,5 +1,4 @@
-// supabase/functions/push-new-image-v1/index.ts (Edge Function)
-// Updated to use HIGH priority, valid Android fields, and clean up UNREGISTERED tokens.
+// supabase/functions/push-new-image-v1/index.ts
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -8,7 +7,8 @@ const SERVICE_ROLE_KEY =
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SERVICE_ROLE_KEY");
 const FCM_PROJECT_ID = Deno.env.get("FCM_PROJECT_ID");
 const FCM_CLIENT_EMAIL = Deno.env.get("FCM_CLIENT_EMAIL");
-const FCM_PRIVATE_KEY = Deno.env.get("FCM_PRIVATE_KEY");
+const FCM_PRIVATE_KEY_RAW = Deno.env.get("FCM_PRIVATE_KEY");
+const FCM_PRIVATE_KEY = FCM_PRIVATE_KEY_RAW?.replace(/\\n/g, "\n");
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -17,6 +17,16 @@ function json(data: unknown, status = 200) {
   });
 }
 
+function base64url(input: string) {
+  return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function pemToArrayBuffer(pem: string) {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
 async function getAccessToken(client_email: string, private_key: string) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
@@ -27,19 +37,8 @@ async function getAccessToken(client_email: string, private_key: string) {
     iat: now,
     exp: now + 3600,
   };
-  function base64url(input: string) {
-    return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
   const enc = (obj: any) => base64url(JSON.stringify(obj));
   const toSign = `${enc(header)}.${enc(payload)}`;
-
-  function pemToArrayBuffer(pem: string) {
-    const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-    const bin = atob(b64);
-    const buf = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-    return buf.buffer;
-  }
   const keyBuf = pemToArrayBuffer(private_key);
   const key = await crypto.subtle.importKey(
     "pkcs8",
@@ -48,44 +47,33 @@ async function getAccessToken(client_email: string, private_key: string) {
     false,
     ["sign"],
   );
-  const sig = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    new TextEncoder().encode(toSign),
-  );
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(toSign));
   const jwt = `${toSign}.${base64url(String.fromCharCode(...new Uint8Array(sig)))}`;
 
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body:
-      `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
   });
-  const j = await res.json();
-  if (!j.access_token) {
-    throw new Error("Failed to get FCM access token: " + JSON.stringify(j));
-  }
-  return j.access_token;
+  const j = await res.json().catch(() => ({}));
+  if (!j.access_token) throw new Error("Failed to get FCM access token: " + JSON.stringify(j));
+  return j.access_token as string;
 }
 
 serve(async (req) => {
   const started = Date.now();
   try {
-    if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-      return json({ ok: false, error: "server misconfigured" }, 500);
-    }
-    if (!FCM_PROJECT_ID || !FCM_CLIENT_EMAIL || !FCM_PRIVATE_KEY) {
-      return json({ ok: false, error: "Missing FCM credentials" }, 500);
-    }
+    if (!SUPABASE_URL || !SERVICE_ROLE_KEY) return json({ ok: false, error: "server misconfigured" }, 500);
+    if (!FCM_PROJECT_ID || !FCM_CLIENT_EMAIL || !FCM_PRIVATE_KEY) return json({ ok: false, error: "Missing FCM credentials" }, 500);
 
     const body = await req.json().catch(() => ({}));
-    const imageId = body?.image_id;
-    const debugNotifySelf = !!body?.debug_notify_self;
+    const imageId = body?.image_id as string | undefined;
+    const includeSender: boolean = (body?.include_sender ?? body?.debug_notify_self ?? true) === true;
     if (!imageId) return json({ ok: false, error: "image_id required" }, 400);
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-    // 1) Get image
+    // 1) Image row
     const { data: image, error: imgErr } = await supabase
       .from("images")
       .select("id, user_id, household_id, file_name, image_url, created_at")
@@ -93,45 +81,46 @@ serve(async (req) => {
       .single();
     if (imgErr || !image) return json({ ok: false, error: "image not found" }, 404);
 
-    // 2) Recipients
+    // 2) Recipients by profiles household
     let recipientIds: string[] = [];
-    const { data: members, error: memErr } = await supabase
-      .from("household_members")
-      .select("user_id")
-      .eq("household_id", image.household_id);
-    if (!memErr && members?.length) {
-      recipientIds = members.map((m) => m.user_id);
-    } else {
-      const { data: allDevs, error: allErr } = await supabase
-        .from("devices")
-        .select("user_id");
-      if (allErr) {
-        return json({ ok: true, sent: 0, reason: "no recipients (fallback failed)" });
-      }
-      recipientIds = [...new Set((allDevs || []).map((d) => d.user_id))];
+    if (image.household_id) {
+      const { data: profs, error: profErr } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("household_id", image.household_id);
+      if (profErr) return json({ ok: false, error: "profiles lookup failed" }, 500);
+      recipientIds = (profs || []).map((p: any) => p.id);
     }
-    if (!debugNotifySelf) {
+    if (!recipientIds.length) {
+      // fallback to anyone with a device
+      const { data: allDevs, error: allErr } = await supabase.from("devices").select("user_id");
+      if (allErr) return json({ ok: true, sent: 0, reason: "no recipients (fallback failed)" });
+      recipientIds = [...new Set((allDevs || []).map((d: any) => d.user_id))];
+    }
+    if (!includeSender) {
       recipientIds = recipientIds.filter((uid) => uid !== image.user_id);
     }
+    recipientIds = [...new Set(recipientIds)];
     if (!recipientIds.length) return json({ ok: true, sent: 0, reason: "no recipients" });
 
     // 3) Tokens
     const { data: tokens, error: tokErr } = await supabase
       .from("devices")
-      .select("token, user_id")
+      .select("token, user_id, platform")
       .in("user_id", recipientIds);
     if (tokErr) return json({ ok: false, error: "token fetch failed" }, 500);
 
-    const registration_ids = (tokens || []).map((t) => t.token).filter(Boolean);
-    if (!registration_ids.length) return json({ ok: true, sent: 0, reason: "no tokens" });
+    const tokenRows = (tokens || []).filter((t: any) => !!t?.token);
+    if (!tokenRows.length) return json({ ok: true, sent: 0, reason: "no tokens" });
 
     // 4) FCM access token
     const accessToken = await getAccessToken(FCM_CLIENT_EMAIL!, FCM_PRIVATE_KEY!);
 
-    // 5) Send one-by-one
+    // 5) Send
     let sent = 0, failure = 0;
     const fcmResults: any[] = [];
-    for (const token of registration_ids) {
+    for (const row of tokenRows) {
+      const token = row.token as string;
       const payload = {
         message: {
           token,
@@ -143,7 +132,7 @@ serve(async (req) => {
             type: "new_image",
             image_id: String(image.id),
             image_url: image.image_url,
-            uploaded_by: image.user_id,
+            uploaded_by: String(image.user_id),
             deep_link: `yourapp://gallery/image/${image.id}`,
           },
           android: {
@@ -157,18 +146,12 @@ serve(async (req) => {
             },
           },
           apns: {
-            headers: {
-              "apns-push-type": "alert",
-              "apns-priority": "10",
-            },
+            headers: { "apns-push-type": "alert", "apns-priority": "10" },
             payload: {
               aps: {
                 sound: "default",
                 badge: 1,
-                alert: {
-                  title: "New Photo Uploaded! 📸",
-                  body: image.file_name || "Check out the latest addition",
-                },
+                alert: { title: "New Photo Uploaded! 📸", body: image.file_name || "Check out the latest addition" },
               },
             },
           },
@@ -178,29 +161,22 @@ serve(async (req) => {
       try {
         const fcmRes = await fetch(
           `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(payload),
-          },
+          { method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(payload) },
         );
         const fcmJson = await fcmRes.json().catch(() => ({}));
         if (fcmRes.ok) {
           sent++;
         } else {
           failure++;
-          const errCode = fcmJson?.error?.details?.[0]?.errorCode;
-          if (errCode === "UNREGISTERED") {
+          const errCode = fcmJson?.error?.details?.[0]?.errorCode || fcmJson?.error?.status;
+          if (errCode === "UNREGISTERED" || errCode === "NOT_FOUND") {
             await supabase.from("devices").delete().eq("token", token);
           }
         }
-        fcmResults.push({ token, status: fcmRes.status, resp: fcmJson });
+        fcmResults.push({ token: token.substring(0, 16) + "…", status: fcmRes.status });
       } catch (e) {
         failure++;
-        fcmResults.push({ token, error: String(e) });
+        fcmResults.push({ token: token.substring(0, 16) + "…", error: String(e) });
       }
     }
 
@@ -210,13 +186,16 @@ serve(async (req) => {
       failure,
       ms: Date.now() - started,
       recipients: recipientIds,
-      tokens: registration_ids,
+      token_count: tokenRows.length,
       fcmResults,
     });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }
 });
+
+
+
 
 
 // import { serve } from "https://deno.land/std@0.224.0/http/server.ts";

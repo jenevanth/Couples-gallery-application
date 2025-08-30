@@ -8,13 +8,29 @@ const SERVICE_ROLE_KEY =
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SERVICE_ROLE_KEY");
 const FCM_PROJECT_ID = Deno.env.get("FCM_PROJECT_ID");
 const FCM_CLIENT_EMAIL = Deno.env.get("FCM_CLIENT_EMAIL");
-const FCM_PRIVATE_KEY = Deno.env.get("FCM_PRIVATE_KEY");
+// Support multiline private keys stored with \n
+const FCM_PRIVATE_KEY_RAW = Deno.env.get("FCM_PRIVATE_KEY");
+const FCM_PRIVATE_KEY = FCM_PRIVATE_KEY_RAW?.replace(/\\n/g, "\n");
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+// base64url encoding
+function base64url(input: string) {
+  return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Convert PEM (pkcs8) private key to ArrayBuffer
+function pemToArrayBuffer(pem: string) {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
 }
 
 // OAuth2 token for FCM HTTP v1
@@ -28,20 +44,11 @@ async function getAccessToken(client_email: string, private_key: string) {
     iat: now,
     exp: now + 3600,
   };
-  function base64url(input: string) {
-    return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
+
   const enc = (obj: any) => base64url(JSON.stringify(obj));
   const toSign = `${enc(header)}.${enc(payload)}`;
 
-  function pemToArrayBuffer(pem: string) {
-    const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-    const bin = atob(b64);
-    const buf = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-    return buf.buffer;
-  }
-
+  // Sign RS256 with service account private key
   const keyBuf = pemToArrayBuffer(private_key);
   const key = await crypto.subtle.importKey(
     "pkcs8",
@@ -51,24 +58,30 @@ async function getAccessToken(client_email: string, private_key: string) {
     ["sign"],
   );
 
-  const sig = await crypto.subtle.sign(
+  const signature = await crypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
     key,
     new TextEncoder().encode(toSign),
   );
-  const jwt = `${toSign}.${base64url(String.fromCharCode(...new Uint8Array(sig)))}`;
+  const sigStr = String.fromCharCode(...new Uint8Array(signature));
+  const jwt = `${toSign}.${base64url(sigStr)}`;
+
+  const params = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion: jwt,
+  });
 
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body:
-      `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    body: params,
   });
-  const j = await res.json();
+
+  const j = await res.json().catch(() => ({}));
   if (!j.access_token) {
     throw new Error("Failed to get FCM access token: " + JSON.stringify(j));
   }
-  return j.access_token;
+  return j.access_token as string;
 }
 
 serve(async (req) => {
@@ -88,8 +101,9 @@ serve(async (req) => {
     const body = await req.json().catch(() => ({}));
     console.log("[fn-msg] body:", body);
 
-    const messageId = body?.message_id;
-    const debugNotifySelf = !!body?.debug_notify_self;
+    const messageId = body?.message_id as string | undefined;
+    // New param: include sender; default true (also keep compatibility with debug_notify_self)
+    const includeSender: boolean = (body?.include_sender ?? body?.debug_notify_self ?? true) === true;
 
     if (!messageId) {
       console.error("[fn-msg] No message_id in body");
@@ -105,7 +119,7 @@ serve(async (req) => {
       .eq("id", messageId)
       .single();
 
-    console.log("[fn-msg] fetched message:", message, "err:", msgErr);
+    console.log("[fn-msg] fetched message err:", msgErr);
     if (msgErr || !message) {
       return json({ ok: false, error: "message not found" }, 404);
     }
@@ -131,7 +145,7 @@ serve(async (req) => {
 
       if (!memErr && members?.length) {
         usedHousehold = true;
-        recipientIds = members.map((m) => m.user_id);
+        recipientIds = members.map((m: any) => m.user_id);
       } else {
         console.warn("[fn-msg] household fallback path, memErr:", memErr);
         const { data: allDevs, error: allErr } = await supabase
@@ -141,14 +155,13 @@ serve(async (req) => {
           console.error("[fn-msg] fallback device users error:", allErr);
           return json({ ok: true, sent: 0, reason: "no recipients (fallback failed)" });
         }
-        recipientIds = [...new Set((allDevs || []).map((d) => d.user_id))];
+        recipientIds = [...new Set((allDevs || []).map((d: any) => d.user_id))];
       }
     } catch (e) {
       console.error("[fn-msg] household lookup exception:", e);
     }
 
-    // exclude sender unless debugNotifySelf
-    if (!debugNotifySelf) {
+    if (!includeSender) {
       recipientIds = recipientIds.filter((uid) => uid !== message.sender_id);
     }
     // unique
@@ -156,19 +169,18 @@ serve(async (req) => {
 
     console.log("[fn-msg] recipients:", {
       count: recipientIds.length,
-      ids: recipientIds,
       usedHousehold,
-      debugNotifySelf,
+      includeSender,
     });
 
     if (!recipientIds.length) {
       return json({ ok: true, sent: 0, reason: "no recipients" });
     }
 
-    // 3) Tokens
+    // 3) Tokens (include platform for optional logging)
     const { data: tokens, error: tokErr } = await supabase
       .from("devices")
-      .select("token, user_id")
+      .select("token, user_id, platform")
       .in("user_id", recipientIds);
 
     if (tokErr) {
@@ -176,8 +188,10 @@ serve(async (req) => {
       return json({ ok: false, error: "token fetch failed" }, 500);
     }
 
-    const registration_ids = (tokens || []).map((t) => t.token).filter(Boolean);
-    console.log("[fn-msg] token count:", registration_ids.length, "tokens:", registration_ids);
+    const tokenRows = (tokens || []).filter((t: any) => !!t?.token);
+    const registration_ids = tokenRows.map((t: any) => t.token);
+
+    console.log("[fn-msg] token count:", registration_ids.length);
 
     if (!registration_ids.length) {
       return json({ ok: true, sent: 0, reason: "no tokens" });
@@ -193,12 +207,16 @@ serve(async (req) => {
       return json({ ok: false, error: "fcm oauth failed" }, 500);
     }
 
-    // 5) Send notifications one-by-one
+    // 5) Send notifications one-by-one and optionally log
     let sent = 0,
       failure = 0;
     const fcmResults: any[] = [];
 
-    for (const token of registration_ids) {
+    for (const row of tokenRows) {
+      const token = row.token as string;
+      const recipientId = row.user_id as string;
+      const platform = row.platform as string | null;
+
       const payload = {
         message: {
           token,
@@ -211,6 +229,7 @@ serve(async (req) => {
             message_id: String(message.id),
             household_id: String(message.household_id || ""),
             sender_id: String(message.sender_id),
+            recipient_id: String(recipientId),
             text: message.text || "",
             deep_link: `yourapp://chat/${message.household_id || ""}`,
           },
@@ -243,6 +262,11 @@ serve(async (req) => {
         },
       };
 
+      let fcmStatus = 0;
+      let fcmMessageId: string | null = null;
+      let errorCode: string | null = null;
+      let errorMessage: string | null = null;
+
       try {
         const fcmRes = await fetch(
           `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`,
@@ -256,23 +280,55 @@ serve(async (req) => {
           },
         );
         const fcmJson = await fcmRes.json().catch(() => ({}));
+        fcmStatus = fcmRes.status;
+        fcmMessageId = fcmJson?.name || null;
+
         if (fcmRes.ok) {
           sent++;
         } else {
           failure++;
-          const errCode = fcmJson?.error?.details?.[0]?.errorCode;
-          if (errCode === "UNREGISTERED") {
-            // cleanup stale token
+          const errCode = fcmJson?.error?.details?.[0]?.errorCode || fcmJson?.error?.status;
+          errorCode = errCode || null;
+          errorMessage = fcmJson?.error?.message || null;
+
+          if (errCode === "UNREGISTERED" || errCode === "NOT_FOUND") {
             await supabase.from("devices").delete().eq("token", token);
-            console.warn("[fn-msg] removed UNREGISTERED token:", token);
+            console.warn("[fn-msg] removed UNREGISTERED token:", token.substring(0, 16) + "…");
+          } else {
+            console.warn("[fn-msg] FCM send failed:", fcmRes.status, fcmJson);
           }
         }
-        fcmResults.push({ token, status: fcmRes.status, resp: fcmJson });
-        console.log("[fn-msg] FCM response:", { token, status: fcmRes.status });
+
+        fcmResults.push({
+          token: token.substring(0, 16) + "…",
+          status: fcmStatus,
+          msgId: fcmMessageId,
+          errorCode,
+        });
       } catch (e) {
         failure++;
-        fcmResults.push({ token, error: String(e) });
-        console.error("[fn-msg] FCM send exception:", token, e);
+        errorMessage = String(e);
+        fcmResults.push({ token: token.substring(0, 16) + "…", error: errorMessage });
+        console.error("[fn-msg] FCM send exception:", e);
+      }
+
+      // Optional: write to push_logs if table exists
+      try {
+        await supabase.from("push_logs").insert({
+          kind: "message",
+          record_id: message.id,
+          sender_id: message.sender_id,
+          household_id: message.household_id,
+          recipient_id: recipientId,
+          token,
+          platform,
+          fcm_status: fcmStatus,
+          fcm_message_id: fcmMessageId,
+          error_code: errorCode,
+          error_message: errorMessage,
+        });
+      } catch (_e) {
+        // swallow logging errors
       }
     }
 
@@ -282,16 +338,326 @@ serve(async (req) => {
       failure,
       ms: Date.now() - started,
       recipients: recipientIds,
-      tokens: registration_ids,
+      token_count: registration_ids.length,
       fcmResults,
     };
     console.log("[fn-msg] DONE:", out);
     return json(out);
   } catch (e) {
-    console.error("[fn-msg] exception:", e && (e.stack || e.message || e));
+    console.error("[fn-msg] exception:", e && ((e as any).stack || (e as any).message || e));
     return json({ ok: false, error: String(e) }, 500);
   }
 });
+
+
+
+
+
+
+
+
+
+// // supabase/functions/push-new-message/index.ts
+// import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+// import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+// // Env secrets
+// const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+// const SERVICE_ROLE_KEY =
+//   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || Deno.env.get("SERVICE_ROLE_KEY");
+// const FCM_PROJECT_ID = Deno.env.get("FCM_PROJECT_ID");
+// const FCM_CLIENT_EMAIL = Deno.env.get("FCM_CLIENT_EMAIL");
+// const FCM_PRIVATE_KEY = Deno.env.get("FCM_PRIVATE_KEY");
+
+// function json(data: unknown, status = 200) {
+//   return new Response(JSON.stringify(data), {
+//     status,
+//     headers: { "Content-Type": "application/json" },
+//   });
+// }
+
+// // OAuth2 token for FCM HTTP v1
+// async function getAccessToken(client_email: string, private_key: string) {
+//   const now = Math.floor(Date.now() / 1000);
+//   const header = { alg: "RS256", typ: "JWT" };
+//   const payload = {
+//     iss: client_email,
+//     scope: "https://www.googleapis.com/auth/firebase.messaging",
+//     aud: "https://oauth2.googleapis.com/token",
+//     iat: now,
+//     exp: now + 3600,
+//   };
+//   function base64url(input: string) {
+//     return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+//   }
+//   const enc = (obj: any) => base64url(JSON.stringify(obj));
+//   const toSign = `${enc(header)}.${enc(payload)}`;
+
+//   function pemToArrayBuffer(pem: string) {
+//     const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+//     const bin = atob(b64);
+//     const buf = new Uint8Array(bin.length);
+//     for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+//     return buf.buffer;
+//   }
+
+//   const keyBuf = pemToArrayBuffer(private_key);
+//   const key = await crypto.subtle.importKey(
+//     "pkcs8",
+//     keyBuf,
+//     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+//     false,
+//     ["sign"],
+//   );
+
+//   const sig = await crypto.subtle.sign(
+//     "RSASSA-PKCS1-v1_5",
+//     key,
+//     new TextEncoder().encode(toSign),
+//   );
+//   const jwt = `${toSign}.${base64url(String.fromCharCode(...new Uint8Array(sig)))}`;
+
+//   const res = await fetch("https://oauth2.googleapis.com/token", {
+//     method: "POST",
+//     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+//     body:
+//       `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+//   });
+//   const j = await res.json();
+//   if (!j.access_token) {
+//     throw new Error("Failed to get FCM access token: " + JSON.stringify(j));
+//   }
+//   return j.access_token;
+// }
+
+// serve(async (req) => {
+//   const started = Date.now();
+//   console.log("[fn-msg] --- push-new-message started ---");
+
+//   try {
+//     if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+//       console.error("[fn-msg] Missing SUPABASE_URL or SERVICE_ROLE_KEY");
+//       return json({ ok: false, error: "server misconfigured" }, 500);
+//     }
+//     if (!FCM_PROJECT_ID || !FCM_CLIENT_EMAIL || !FCM_PRIVATE_KEY) {
+//       console.error("[fn-msg] Missing FCM credentials");
+//       return json({ ok: false, error: "Missing FCM credentials" }, 500);
+//     }
+
+//     const body = await req.json().catch(() => ({}));
+//     console.log("[fn-msg] body:", body);
+
+//     const messageId = body?.message_id;
+//     const debugNotifySelf = !!body?.debug_notify_self;
+
+//     if (!messageId) {
+//       console.error("[fn-msg] No message_id in body");
+//       return json({ ok: false, error: "message_id required" }, 400);
+//     }
+
+//     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+
+//     // 1) Fetch message
+//     const { data: message, error: msgErr } = await supabase
+//       .from("messages")
+//       .select("id, sender_id, household_id, text, created_at")
+//       .eq("id", messageId)
+//       .single();
+
+//     console.log("[fn-msg] fetched message:", message, "err:", msgErr);
+//     if (msgErr || !message) {
+//       return json({ ok: false, error: "message not found" }, 404);
+//     }
+
+//     // Helper: format notification body
+//     const sanitizeText = (t?: string) => {
+//       const s = (t || "").trim();
+//       if (!s) return "New message";
+//       return s.length > 100 ? s.slice(0, 100) + "…" : s;
+//     };
+//     const notifTitle = "New message 💬";
+//     const notifBody = sanitizeText(message.text);
+
+//     // 2) Recipients (household members or fallback to all device users)
+//     let recipientIds: string[] = [];
+//     let usedHousehold = false;
+
+//     try {
+//       const { data: members, error: memErr } = await supabase
+//         .from("household_members")
+//         .select("user_id")
+//         .eq("household_id", message.household_id);
+
+//       if (!memErr && members?.length) {
+//         usedHousehold = true;
+//         recipientIds = members.map((m) => m.user_id);
+//       } else {
+//         console.warn("[fn-msg] household fallback path, memErr:", memErr);
+//         const { data: allDevs, error: allErr } = await supabase
+//           .from("devices")
+//           .select("user_id");
+//         if (allErr) {
+//           console.error("[fn-msg] fallback device users error:", allErr);
+//           return json({ ok: true, sent: 0, reason: "no recipients (fallback failed)" });
+//         }
+//         recipientIds = [...new Set((allDevs || []).map((d) => d.user_id))];
+//       }
+//     } catch (e) {
+//       console.error("[fn-msg] household lookup exception:", e);
+//     }
+
+//     // exclude sender unless debugNotifySelf
+//     if (!debugNotifySelf) {
+//       recipientIds = recipientIds.filter((uid) => uid !== message.sender_id);
+//     }
+//     // unique
+//     recipientIds = [...new Set(recipientIds)];
+
+//     console.log("[fn-msg] recipients:", {
+//       count: recipientIds.length,
+//       ids: recipientIds,
+//       usedHousehold,
+//       debugNotifySelf,
+//     });
+
+//     if (!recipientIds.length) {
+//       return json({ ok: true, sent: 0, reason: "no recipients" });
+//     }
+
+//     // 3) Tokens
+//     const { data: tokens, error: tokErr } = await supabase
+//       .from("devices")
+//       .select("token, user_id")
+//       .in("user_id", recipientIds);
+
+//     if (tokErr) {
+//       console.error("[fn-msg] token fetch error:", tokErr);
+//       return json({ ok: false, error: "token fetch failed" }, 500);
+//     }
+
+//     const registration_ids = (tokens || []).map((t) => t.token).filter(Boolean);
+//     console.log("[fn-msg] token count:", registration_ids.length, "tokens:", registration_ids);
+
+//     if (!registration_ids.length) {
+//       return json({ ok: true, sent: 0, reason: "no tokens" });
+//     }
+
+//     // 4) FCM Access Token
+//     let accessToken = "";
+//     try {
+//       accessToken = await getAccessToken(FCM_CLIENT_EMAIL!, FCM_PRIVATE_KEY!);
+//       console.log("[fn-msg] got FCM access token");
+//     } catch (e) {
+//       console.error("[fn-msg] FCM access token error:", e);
+//       return json({ ok: false, error: "fcm oauth failed" }, 500);
+//     }
+
+//     // 5) Send notifications one-by-one
+//     let sent = 0,
+//       failure = 0;
+//     const fcmResults: any[] = [];
+
+//     for (const token of registration_ids) {
+//       const payload = {
+//         message: {
+//           token,
+//           notification: {
+//             title: notifTitle,
+//             body: notifBody,
+//           },
+//           data: {
+//             type: "chat_message",
+//             message_id: String(message.id),
+//             household_id: String(message.household_id || ""),
+//             sender_id: String(message.sender_id),
+//             text: message.text || "",
+//             deep_link: `yourapp://chat/${message.household_id || ""}`,
+//           },
+//           android: {
+//             priority: "HIGH",
+//             notification: {
+//               channel_id: "default",
+//               sound: "default",
+//               visibility: "PUBLIC",
+//               default_vibrate_timings: true,
+//               default_light_settings: true,
+//             },
+//           },
+//           apns: {
+//             headers: {
+//               "apns-push-type": "alert",
+//               "apns-priority": "10",
+//             },
+//             payload: {
+//               aps: {
+//                 sound: "default",
+//                 badge: 1,
+//                 alert: {
+//                   title: notifTitle,
+//                   body: notifBody,
+//                 },
+//               },
+//             },
+//           },
+//         },
+//       };
+
+//       try {
+//         const fcmRes = await fetch(
+//           `https://fcm.googleapis.com/v1/projects/${FCM_PROJECT_ID}/messages:send`,
+//           {
+//             method: "POST",
+//             headers: {
+//               Authorization: `Bearer ${accessToken}`,
+//               "Content-Type": "application/json",
+//             },
+//             body: JSON.stringify(payload),
+//           },
+//         );
+//         const fcmJson = await fcmRes.json().catch(() => ({}));
+//         if (fcmRes.ok) {
+//           sent++;
+//         } else {
+//           failure++;
+//           const errCode = fcmJson?.error?.details?.[0]?.errorCode;
+//           if (errCode === "UNREGISTERED") {
+//             // cleanup stale token
+//             await supabase.from("devices").delete().eq("token", token);
+//             console.warn("[fn-msg] removed UNREGISTERED token:", token);
+//           }
+//         }
+//         fcmResults.push({ token, status: fcmRes.status, resp: fcmJson });
+//         console.log("[fn-msg] FCM response:", { token, status: fcmRes.status });
+//       } catch (e) {
+//         failure++;
+//         fcmResults.push({ token, error: String(e) });
+//         console.error("[fn-msg] FCM send exception:", token, e);
+//       }
+//     }
+
+//     const out = {
+//       ok: true,
+//       sent,
+//       failure,
+//       ms: Date.now() - started,
+//       recipients: recipientIds,
+//       tokens: registration_ids,
+//       fcmResults,
+//     };
+//     console.log("[fn-msg] DONE:", out);
+//     return json(out);
+//   } catch (e) {
+//     console.error("[fn-msg] exception:", e && (e.stack || e.message || e));
+//     return json({ ok: false, error: String(e) }, 500);
+//   }
+// });
+
+
+
+
+
+
+
 
 
 
