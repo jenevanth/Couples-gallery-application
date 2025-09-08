@@ -21,6 +21,10 @@ DerivedData
 *.ipa
 *.xcuserstate
 **/.xcode.env.local
+.env
+.env.*
+**/.env
+*/.env.
 
 # Android/IntelliJ
 #
@@ -40,7 +44,25 @@ local.properties
 node_modules/
 npm-debug.log
 yarn-error.log
+backend/.env*
+backend/.vercel/*
+!.vercel/project.json # optional keep only project id if you want
+supabase/.env*
+supabase/.secrets/*
+supabase/.temp
+supabase/.branches/*
+**/node_modules/
+**/build/
+**/.gradle/
 
+**/dist/
+**/.expo/
+**/.cache/
+*.jks
+*.log
+*.tmp
+*.keystore
+!debug.keystore
 # fastlane
 #
 # It is recommended to not store the screenshots in the git repo. Instead, use fastlane to re-generate the

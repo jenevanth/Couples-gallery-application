@@ -83,7 +83,7 @@ const PrivateChatScreen = ({ navigation }) => {
   const [userId, setUserId] = useState(null);
   const [householdId, setHouseholdId] = useState(null);
   const [partnerId, setPartnerId] = useState(null);
-  const [partnerName, setPartnerName] = useState('Chat');
+  const [partnerName, setPartnerName] = useState('My Love');
   const [partnerFcmToken, setPartnerFcmToken] = useState(null);
 
   // Presence/typing
